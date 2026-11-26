@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Yoji
+
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -24,7 +27,7 @@ namespace Upipe.Editor
     [InitializeOnLoad]
     internal static class UpipeServer
     {
-        internal const string FallbackVersion = "0.3.3";
+        internal const string FallbackVersion = "0.3.4";
         public static string Version { get; private set; } = FallbackVersion;
 
         const int FirstPort = 7800;

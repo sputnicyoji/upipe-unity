@@ -2,7 +2,7 @@
 
 Independent Editor HTTP server for Unity 2022.3 that the official `unity` CLI (`unity command ...`) can drive, the same way it drives a Unity 6 project with `com.unity.pipeline`. Implemented independently under the MIT license from public Pipeline documentation and observed CLI behavior; it contains no code from `com.unity.pipeline`. Not affiliated with or endorsed by Unity Technologies.
 
-Version 0.3.3 for Unity 2022.3. Not supported: `commandLine` form, Pipeline binary transport.
+Version 0.3.4 for Unity 2022.3. Not supported: `commandLine` form, Pipeline binary transport.
 
 ## Highlights
 
@@ -38,7 +38,7 @@ The official `unity` CLI is a standalone binary that works independently of Unit
    - **From Git** (recommended; append `#<tag>` to pin a release) in `Packages/manifest.json`:
 
      ```json
-     "com.upipe.server": "https://github.com/sputnicyoji/upipe-unity.git#v0.3.3"
+     "com.upipe.server": "https://github.com/sputnicyoji/upipe-unity.git#v0.3.4"
      ```
 
    - **Embedded**: copy this folder to `<project>/Packages/com.upipe.server/`. Unity picks it up on the next focus or launch. The server is on by default for everyone who opens the project; see [Local Switch](#local-switch) below.
@@ -158,7 +158,7 @@ The CLI always sends a request timeout (30000 ms by default, `--timeout` seconds
 
 Known limits:
 - Enabled by default: committing the package to a shared repository turns the server on for every teammate until they switch it off locally.
-- 0.3.0 is verified on macOS (Metal) and Windows 11 (D3D11, 100% display scaling) with unity CLI 1.0.0-beta.13 and `com.unity.test-framework` 1.1.33 and 1.4.3: `-batchmode`, cold start, disabled mode, `--quit`, the interactive Editor and `unity mcp`. CLI 1.0.1 passed the 0.2.0 smoke test except `unity list`, which 1.0.1 removed. 0.3.2 / 0.3.3 are verified with unity CLI 1.0.0-beta.13 on `2022.3.62f3c1` (macOS and Windows 11, `com.unity.test-framework` 1.4.3) and `2022.3.62f2c1` (Windows 11, `com.unity.test-framework` 1.4.3 and 1.1.33); see [CHANGELOG.md](CHANGELOG.md).
+- 0.3.0 is verified on macOS (Metal) and Windows 11 (D3D11, 100% display scaling) with unity CLI 1.0.0-beta.13 and `com.unity.test-framework` 1.1.33 and 1.4.3: `-batchmode`, cold start, disabled mode, `--quit`, the interactive Editor and `unity mcp`. CLI 1.0.1 passed the 0.2.0 smoke test except `unity list`, which 1.0.1 removed. 0.3.2–0.3.4 are verified with unity CLI 1.0.0-beta.13 on `2022.3.62f3c1` (macOS and Windows 11, `com.unity.test-framework` 1.4.3) and `2022.3.62f2c1` (Windows 11, `com.unity.test-framework` 1.4.3 and 1.1.33); see [CHANGELOG.md](CHANGELOG.md).
 
 Known issue: on 2022.3.62f3c1, `-batchmode -runTests` may not exit after writing results, with or without this package installed (always on macOS, now and then on Windows). Read the results file and stop the process.
 

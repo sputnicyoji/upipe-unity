@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Yoji
+
 using NUnit.Framework;
 using UnityEngine;
 using UnityEngine.TestTools;
