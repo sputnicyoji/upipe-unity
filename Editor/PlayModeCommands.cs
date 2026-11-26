@@ -1,5 +1,7 @@
 using Newtonsoft.Json.Linq;
 using UnityEditor;
+using UnityEditor.Build;
+using UnityEditor.Build.Reporting;
 using UnityEngine;
 
 namespace Upipe.Editor
@@ -7,22 +9,37 @@ namespace Upipe.Editor
     // `editor.playmode start|stop|pause|set_run_in_background` and `editor set_auto_tick`.
     // Run In Background is a Player Setting that ships in builds, so an override first records the project's value in
     // SessionState and puts it back when the Editor returns to Edit Mode or quits: ProjectSettings.asset never keeps it.
-    [InitializeOnLoad]
     internal static class PlayModeCommands
     {
         // The project's runInBackground before the first override in this Editor session: 0 or 1, -1 when not overridden.
         const string OriginalRunInBackgroundKey = "Upipe.RunInBackground.Original";
+        // Temporarily holds the overridden value while a Player build temporarily restores the project setting.
+        const string PausedOverrideValueKey = "Upipe.RunInBackground.PausedForBuild";
         const int DefaultAutoTickIntervalMs = 16;
         const int MaxAutoTickIntervalMs = 60000;
 
-        static PlayModeCommands()
+        static bool s_Attached;
+
+        public static void Attach()
         {
-            EditorApplication.playModeStateChanged += state =>
-            {
-                if (state == PlayModeStateChange.EnteredEditMode)
-                    RestoreRunInBackground();
-            };
-            EditorApplication.quitting += RestoreRunInBackground;
+            if (s_Attached)
+                return;
+            s_Attached = true;
+            EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
+        }
+
+        public static void Detach()
+        {
+            if (!s_Attached)
+                return;
+            s_Attached = false;
+            EditorApplication.playModeStateChanged -= OnPlayModeStateChanged;
+        }
+
+        static void OnPlayModeStateChanged(PlayModeStateChange state)
+        {
+            if (state == PlayModeStateChange.EnteredEditMode)
+                RestoreRunInBackground();
         }
 
         public static void Register()
@@ -68,6 +85,7 @@ namespace Upipe.Editor
             {
                 Group = "editor.playmode",
                 Name = "pause",
+                Alias = "editor_pause",
                 Description = "Pause Play Mode, or resume it with paused=false.",
                 Tags = new[] { "playmode" },
                 Parameters = new[]
@@ -104,6 +122,11 @@ namespace Upipe.Editor
 
         static object Start(JObject parameters)
         {
+            // Unity would not enter Play Mode, so nothing would ever restore the override below. While a compile runs the flag
+            // may still describe the previous one, which this compile may fix.
+            if (EditorUtility.scriptCompilationFailed && !EditorApplication.isCompiling && !EditorApplication.isUpdating)
+                throw new CommandFailure("Command Execution Failed",
+                    "SCRIPT_COMPILATION_FAILED: Unity does not enter Play Mode while scripts have compile errors; fix them first.");
             if (CommandRegistry.ReadBool(parameters, "run-in-background", true))
                 OverrideRunInBackground(true);
             EditorApplication.isPlaying = true;
@@ -134,10 +157,10 @@ namespace Upipe.Editor
         internal static bool IsRunInBackgroundOverridden => SessionState.GetInt(OriginalRunInBackgroundKey, -1) >= 0;
 
         // Main thread only. Only the first override records the original, so overriding twice still restores the project's value.
-        // shortcut: a player build made while the override is on ships with it; put the project's value back around
-        // builds (IPreprocessBuildWithReport) if builds run from an Editor that a CLI session is driving.
         internal static void OverrideRunInBackground(bool value)
         {
+            // A failed or cancelled build never reaches OnAfterBuild; its paused value must not outlive this override.
+            SessionState.EraseInt(PausedOverrideValueKey);
             if (!IsRunInBackgroundOverridden)
                 SessionState.SetInt(OriginalRunInBackgroundKey, Application.runInBackground ? 1 : 0);
             if (Application.runInBackground != value)
@@ -146,6 +169,7 @@ namespace Upipe.Editor
 
         internal static void RestoreRunInBackground()
         {
+            SessionState.EraseInt(PausedOverrideValueKey);
             var original = SessionState.GetInt(OriginalRunInBackgroundKey, -1);
             if (original < 0)
                 return;
@@ -153,5 +177,35 @@ namespace Upipe.Editor
             if (Application.runInBackground != (original == 1))
                 Application.runInBackground = original == 1;
         }
+
+        internal static void OnBeforeBuild()
+        {
+            var original = SessionState.GetInt(OriginalRunInBackgroundKey, -1);
+            if (original < 0)
+                return;
+            SessionState.SetInt(PausedOverrideValueKey, Application.runInBackground ? 1 : 0);
+            if (Application.runInBackground != (original == 1))
+                Application.runInBackground = original == 1;
+        }
+
+        internal static void OnAfterBuild()
+        {
+            var pausedValue = SessionState.GetInt(PausedOverrideValueKey, -1);
+            if (pausedValue < 0)
+                return;
+            SessionState.EraseInt(PausedOverrideValueKey);
+            if (IsRunInBackgroundOverridden && Application.runInBackground != (pausedValue == 1))
+                Application.runInBackground = pausedValue == 1;
+        }
+    }
+
+    // Restores the project's saved Run In Background around Player builds when a CLI session has overridden it.
+    internal sealed class RunInBackgroundBuildGuard : IPreprocessBuildWithReport, IPostprocessBuildWithReport
+    {
+        public int callbackOrder => 0;
+
+        public void OnPreprocessBuild(BuildReport report) => PlayModeCommands.OnBeforeBuild();
+
+        public void OnPostprocessBuild(BuildReport report) => PlayModeCommands.OnAfterBuild();
     }
 }

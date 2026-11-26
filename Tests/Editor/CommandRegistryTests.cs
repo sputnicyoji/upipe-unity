@@ -178,9 +178,11 @@ namespace Upipe.Editor.Tests
                 ("script_eval", "script", "eval"),
                 ("editor_play", "editor.playmode", "start"),
                 ("editor_stop", "editor.playmode", "stop"),
+                ("editor_pause", "editor.playmode", "pause"),
                 ("set_autotick", "editor", "set_auto_tick"),
                 ("editor_set_run_in_background", "editor.playmode", "set_run_in_background"),
                 ("clear_console", "console", "clear"),
+                ("console_write", "console", "write"),
             };
             foreach (var (alias, group, name) in cases)
             {
@@ -189,6 +191,11 @@ namespace Upipe.Editor.Tests
                 Assert.AreSame(expected, CommandRegistry.ResolveTokens(new[] { alias }).Command, alias);
                 Assert.AreSame(expected, CommandRegistry.ResolveStructured(alias, out _), alias);
             }
+            // Unique bare short names still work in CLI/structured invocations without exposing bare verbs in catalog.
+            Assert.AreSame(CommandRegistry.Find("console", "write"), CommandRegistry.ResolveTokens(new[] { "write" }).Command);
+            Assert.AreSame(CommandRegistry.Find("editor.playmode", "pause"), CommandRegistry.ResolveStructured("pause", out _));
+            Assert.AreEqual("console_write", (string)CommandRegistry.Find("console", "write").ToCatalogEntry()["name"]);
+            Assert.AreEqual("editor_pause", (string)CommandRegistry.Find("editor.playmode", "pause").ToCatalogEntry()["name"]);
         }
 
         [Test]
@@ -235,6 +242,78 @@ namespace Upipe.Editor.Tests
             Assert.IsTrue(ok.Ok, Kinds(ok));
             Assert.AreEqual("3", (string)ok.Values["tail"]);
             Assert.AreEqual("typeMismatch", Kinds(CommandRegistry.BindArgv(command, new[] { "--tail", "x" })));
+        }
+
+        // Structured requests follow argv's rules: a dry run sent as "1" must not bind as false and run the code.
+        [Test]
+        public void StructuredValuesMustParseAsTheirTypeAndNullIsNotGiven()
+        {
+            var command = new CommandEntry
+            {
+                Group = "sample",
+                Name = "typed",
+                Parameters = new[]
+                {
+                    new CommandParameter { Name = "path", Required = true },
+                    new CommandParameter { Name = "force", IsBool = true },
+                    new CommandParameter { Name = "tail", IsInteger = true },
+                },
+                Handler = _ => null,
+            };
+            var ok = CommandRegistry.BindStructured(command, new JObject { ["path"] = "a", ["force"] = "true", ["tail"] = 3 });
+            Assert.IsTrue(ok.Ok, Kinds(ok));
+            Assert.IsTrue(CommandRegistry.BindStructured(command, new JObject { ["path"] = "a", ["force"] = false, ["tail"] = "4" }).Ok);
+            Assert.AreEqual("typeMismatch", Kinds(CommandRegistry.BindStructured(command, new JObject { ["path"] = "a", ["force"] = "1" })));
+            Assert.AreEqual("typeMismatch", Kinds(CommandRegistry.BindStructured(command, new JObject { ["path"] = "a", ["force"] = 1 })));
+            Assert.AreEqual("typeMismatch", Kinds(CommandRegistry.BindStructured(command, new JObject { ["path"] = "a", ["tail"] = "x" })));
+            Assert.AreEqual("typeMismatch", Kinds(CommandRegistry.BindStructured(command, new JObject { ["path"] = "a", ["tail"] = 1.5 })));
+            Assert.AreEqual("missingRequired", Kinds(CommandRegistry.BindStructured(command, new JObject { ["path"] = null })));
+            var unset = CommandRegistry.BindStructured(command, new JObject { ["path"] = "a", ["force"] = null });
+            Assert.IsTrue(unset.Ok, Kinds(unset));
+            Assert.IsFalse(unset.Values.ContainsKey("force"));
+        }
+
+        static CommandEntry WithList() => new CommandEntry
+        {
+            Group = "sample",
+            Name = "list",
+            Parameters = new[]
+            {
+                new CommandParameter { Name = "file", Required = true },
+                new CommandParameter { Name = "extra-files", Repeatable = true },
+            },
+            Handler = _ => null,
+        };
+
+        [Test]
+        public void RepeatableFlagCollectsEveryValueInOrder()
+        {
+            var repeated = CommandRegistry.BindArgv(WithList(), new[] { "a.cs", "--extra-files", "b.cs", "--extra_files=c.cs", "--extra-files", "d;e" });
+            Assert.IsTrue(repeated.Ok, Kinds(repeated));
+            CollectionAssert.AreEqual(new[] { "b.cs", "c.cs", "d;e" }, repeated.Values["extra-files"].Select(t => (string)t));
+            CollectionAssert.AreEqual(new[] { "b.cs", "c.cs", "d;e" }, CommandRegistry.ReadStrings(repeated.Values, "extra-files"));
+
+            var once = CommandRegistry.BindArgv(WithList(), new[] { "a.cs", "--extra-files", "[\"x.cs\",\"y.cs\"]" });
+            CollectionAssert.AreEqual(new[] { "x.cs", "y.cs" }, CommandRegistry.ReadStrings(once.Values, "extra-files"), "a JSON array from argv is expanded");
+            // A positional past the other slots lands in the repeatable one, like any optional parameter.
+            CollectionAssert.AreEqual(new[] { "z.cs" }, CommandRegistry.ReadStrings(CommandRegistry.BindArgv(WithList(), new[] { "a.cs", "z.cs" }).Values, "extra-files"));
+            Assert.AreEqual("duplicate", Kinds(CommandRegistry.BindArgv(WithList(), new[] { "--file", "a.cs", "--file", "b.cs" })), "only Repeatable parameters repeat");
+            Assert.IsEmpty(CommandRegistry.ReadStrings(CommandRegistry.BindArgv(WithList(), new[] { "a.cs" }).Values, "extra-files"));
+        }
+
+        [Test]
+        public void RepeatableStructuredValueIsAStringOrAnArrayOfStrings()
+        {
+            var array = CommandRegistry.BindStructured(WithList(), JObject.Parse("{\"file\":\"a.cs\",\"extra_files\":[\"b.cs\",\"c.cs\"]}"));
+            Assert.IsTrue(array.Ok, Kinds(array));
+            CollectionAssert.AreEqual(new[] { "b.cs", "c.cs" }, CommandRegistry.ReadStrings(array.Values, "extra-files"));
+            var text = CommandRegistry.BindStructured(WithList(), JObject.Parse("{\"file\":\"a.cs\",\"extra-files\":\"b.cs;c.cs\"}"));
+            CollectionAssert.AreEqual(new[] { "b.cs;c.cs" }, CommandRegistry.ReadStrings(text.Values, "extra-files"));
+            Assert.AreEqual("typeMismatch", Kinds(CommandRegistry.BindStructured(WithList(), JObject.Parse("{\"file\":\"a.cs\",\"extra-files\":[1]}"))));
+            System.Func<string, System.Collections.Generic.IEnumerable<string>> split = v => v.Split(';');
+            CollectionAssert.AreEqual(new[] { "b.cs", "c.cs", "d;e.cs" },
+                CommandRegistry.ReadStrings(new JObject { ["x"] = new JArray("b.cs;c.cs", "[\"d;e.cs\"]") }, "x", split), "JSON array elements are not split");
+            Assert.AreEqual("typeMismatch", Kinds(CommandRegistry.BindStructured(WithList(), JObject.Parse("{\"file\":\"a.cs\",\"extra-files\":{\"a\":1}}"))));
         }
     }
 }

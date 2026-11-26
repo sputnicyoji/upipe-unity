@@ -19,6 +19,21 @@ namespace Upipe.Editor
         const int MaxResultDepth = 4;
         const int MaxResultItems = 1000;
         const int MaxResultNodes = 10000;
+        const int MaxVoidHashes = 64;
+        const string EvalNoWarn = "1998,0162,0105";
+
+        static readonly object s_VoidLock = new object();
+        static readonly HashSet<string> s_VoidTrailingHashes = new HashSet<string>(StringComparer.Ordinal);
+        static readonly Queue<string> s_VoidOrder = new Queue<string>();
+
+        internal static void Detach()
+        {
+            lock (s_VoidLock)
+            {
+                s_VoidTrailingHashes.Clear();
+                s_VoidOrder.Clear();
+            }
+        }
 
         // Called on the main thread while the server starts.
         public static void Register()
@@ -51,11 +66,12 @@ namespace Upipe.Editor
 
         // `timedOut` is cancelled when the request times out: work that has not started is skipped and this
         // HTTP thread stops waiting, while a script already running keeps going on the main thread, as the docs say.
-        static object Eval(JObject parameters, CancellationToken timedOut)
+        static object Eval(JObject parameters, CommandContext context)
         {
+            var timedOut = context.Cancel;
             var code = (string)parameters["code"];
             var file = (string)parameters["file"];
-            var dryRun = bool.TryParse(parameters["dry-run"]?.ToString(), out var flag) && flag;
+            var dryRun = CommandRegistry.ReadBool(parameters, "dry-run", false);
             if (code != null && file != null)
                 throw CommandFailure.InvalidUsage("Give either the code or --file, not both.");
             if (code == null && file == null)
@@ -65,34 +81,37 @@ namespace Upipe.Editor
             if (string.IsNullOrWhiteSpace(code))
                 throw CommandFailure.InvalidUsage("The code to evaluate is empty.");
 
-            var namespaceName = "UpipeEval_" + Guid.NewGuid().ToString("N");
-            var (assembly, symbols) = CompileScript(code, namespaceName);
+            var namespaceName = "UpipeEval_" + CscCompiler.ShortHash(code);
+            var (assembly, symbols) = CompileScript(code, namespaceName, timedOut);
             if (dryRun)
                 return null;
             timedOut.ThrowIfCancellationRequested();
 
-            Task<object> script;
-            try
-            {
-                script = (Task<object>)MainThreadQueue.Run(() => Start(assembly, symbols, namespaceName + "." + EvalSource.ClassName), timedOut).Result;
-            }
-            catch (AggregateException e)
-            {
-                var error = UpipeServer.Unwrap(e);
-                if (error is EditorReloadingException || error is OperationCanceledException)
-                    throw error;
-                throw new CommandFailure("Command Execution Failed", "EVAL_INTERNAL_ERROR: " + error.Message);
-            }
+            var script = (Task<object>)MainThreadQueue.RunAndWait(
+                () => Start(assembly, symbols, namespaceName + "." + EvalSource.ClassName), timedOut, "EVAL_INTERNAL_ERROR: could not start the script");
+            return Await(script, timedOut, "EVAL_INTERNAL_ERROR");
+        }
 
+        // Waits for a started script (eval or script run) and converts its value. From here on a domain reload must
+        // not read as the retryable 503: the script has started, and a client that resends would run it again from the top.
+        internal static object Await(Task<object> script, CancellationToken cancel, string internalError)
+        {
             try
             {
-                // Blocks this HTTP thread only; the script's awaits resume on the main thread.
-                script.Wait(timedOut);
+                // Blocks this thread only; the script's awaits resume where their awaitable resumes them.
+                script.Wait(cancel);
+            }
+            catch (Exception e) when (MainThreadQueue.DomainReloadInProgress && UpipeServer.Unwrap(e) is OperationCanceledException)
+            {
+                throw new CommandFailure("Command Execution Failed",
+                    "The script started, but a domain reload cut it off; check what it did before running it again.");
             }
             catch (AggregateException e)
             {
                 var error = UpipeServer.Unwrap(e);
-                // Frames in the script read "in script:LINE" rather than the temporary file's full path.
+                if (error is OperationCanceledException && cancel.IsCancellationRequested)
+                    throw error;
+                // Eval frames read "in script:LINE" rather than the temporary file's full path.
                 var trace = (error.StackTrace ?? "").Replace(CscCompiler.WorkDirectory + Path.DirectorySeparatorChar, "");
                 throw new CommandFailure("Command Execution Failed",
                     $"RUNTIME_EXCEPTION: Runtime Error. {error.GetType().Name}: {error.Message}\n{trace}");
@@ -101,43 +120,67 @@ namespace Upipe.Editor
             try
             {
                 // Reading a Unity object (even its name) is main-thread only.
-                return MainThreadQueue.Run(() => ToJson(value, 0, new Budget()), timedOut).Result;
+                return MainThreadQueue.RunAndWait(() => ToJson(value), cancel, internalError + ": could not convert the result");
             }
-            catch (AggregateException e)
+            catch (Exception e) when (e is EditorReloadingException || (MainThreadQueue.DomainReloadInProgress && e is OperationCanceledException))
             {
-                var error = UpipeServer.Unwrap(e);
-                // Not the retryable 503: the script has run (it may have asked for this very reload), and a client
-                // that resends would run it again.
-                if (error is EditorReloadingException)
-                    throw new CommandFailure("Command Execution Failed",
-                        "The script ran, but a domain reload started before its result could be read.");
-                if (error is OperationCanceledException)
-                    throw error;
-                throw new CommandFailure("Command Execution Failed", "EVAL_INTERNAL_ERROR: could not convert the result: " + error.Message);
+                throw new CommandFailure("Command Execution Failed",
+                    "The script ran, but a domain reload started before its result could be read.");
             }
         }
 
         // A trailing expression is returned as the result; when it turns out to be a void call (Debug.Log("x")),
-        // compile it again as a plain statement, which returns null.
-        static (byte[] assembly, byte[] symbols) CompileScript(string code, string namespaceName)
+        // compile it again as a plain statement, which returns null, and remember its hash so repeats hit cache directly.
+        static (byte[] assembly, byte[] symbols) CompileScript(string code, string namespaceName, CancellationToken cancel)
         {
+            var codeHash = CscCompiler.ShortHash(code);
+            bool knownVoid;
+            lock (s_VoidLock)
+                knownVoid = s_VoidTrailingHashes.Contains(codeHash);
+            if (knownVoid)
+                return Compile(namespaceName, EvalSource.Build(code, namespaceName, wrapTrailing: false), cancel);
+
+            if (EvalSource.HasTrailingExpression(code))
+            {
+                var statementSource = EvalSource.Build(code, namespaceName, wrapTrailing: false);
+                if (CscCompiler.TryCompileFromCache(namespaceName, statementSource, EvalNoWarn, CscCompiler.EditorDefines, out var cachedAsm, out var cachedPdb))
+                {
+                    RememberVoidHash(codeHash);
+                    return (cachedAsm, cachedPdb);
+                }
+            }
+
             try
             {
-                return Compile(namespaceName, EvalSource.Build(code, namespaceName));
+                return Compile(namespaceName, EvalSource.Build(code, namespaceName), cancel);
             }
             catch (CommandFailure failure) when (failure.Message.Contains("error CS0030: Cannot convert type 'void' to 'object'") &&
                                                  EvalSource.HasTrailingExpression(code))
             {
-                return Compile(namespaceName, EvalSource.Build(code, namespaceName, wrapTrailing: false));
+                RememberVoidHash(codeHash);
+                return Compile(namespaceName, EvalSource.Build(code, namespaceName, wrapTrailing: false), cancel);
             }
         }
 
-        // Absolute, or relative to the project root; also used by script run.
-        internal static string ResolveScriptPath(string file)
+        static void RememberVoidHash(string codeHash)
+        {
+            lock (s_VoidLock)
+            {
+                if (s_VoidTrailingHashes.Add(codeHash))
+                {
+                    s_VoidOrder.Enqueue(codeHash);
+                    while (s_VoidOrder.Count > MaxVoidHashes)
+                        s_VoidTrailingHashes.Remove(s_VoidOrder.Dequeue());
+                }
+            }
+        }
+
+        // Absolute, or relative to the project root; also used by script run (`option` names the flag in errors).
+        internal static string ResolveScriptPath(string file, string option = "--file")
         {
             var path = UpipeServer.ResolveProjectPath(file);
             if (!path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
-                throw CommandFailure.InvalidUsage("--file must name a .cs file: " + path);
+                throw CommandFailure.InvalidUsage(option + " must name a .cs file: " + path);
             if (!File.Exists(path))
                 throw CommandFailure.InvalidUsage("File not found: " + path);
             return path;
@@ -149,17 +192,15 @@ namespace Upipe.Editor
             return loaded.GetType(typeName).GetMethod("Run").Invoke(null, null);
         }
 
-        static (byte[] assembly, byte[] symbols) Compile(string name, string source)
+        static (byte[] assembly, byte[] symbols) Compile(string name, string source, CancellationToken cancel)
         {
             // async method without await, the unreachable `return null` after a script's own return, duplicate usings
-            var (assembly, symbols, errors) = CscCompiler.Compile(name, source, "1998,0162,0105");
+            var (assembly, symbols, errors) = CscCompiler.Compile(name, source, EvalNoWarn, CscCompiler.EditorDefines, cancel);
             if (errors.Count == 0)
                 return (assembly, symbols);
             // Errors in the user's lines read as the official package prints them (1-based line, 0-based column);
             // csc prints the #line file relative to its own folder. Errors in the generated wrapper stay raw.
-            var lines = errors.Select(e => Path.GetFileName(e.File) == EvalSource.ScriptFileName
-                ? $"line {e.Line}, col {e.Column - 1}: error {e.Id}: {e.Message}"
-                : e.Raw).ToList();
+            var lines = errors.Select(e => Path.GetFileName(e.File) == EvalSource.ScriptFileName ? e.LineColumnText : e.Raw).ToList();
             throw new CommandFailure("Command Execution Failed",
                 $"COMPILATION_ERROR: Compilation Failed: {lines.Count} error(s)\n" + string.Join("\n", lines));
         }
@@ -183,6 +224,8 @@ namespace Upipe.Editor
                 return null;
             if (value is UnityEngine.Object unityObject)
                 return unityObject == null ? null : unityObject.ToString(); // a destroyed object compares equal to null
+            if (value is JToken token)
+                return token.DeepClone();
             var type = value.GetType();
             if (value is string || value is bool || value is decimal || type.IsPrimitive)
                 return JToken.FromObject(value);

@@ -13,6 +13,11 @@ namespace Upipe.Editor
         public bool IsBool;
         // Bound as the string the caller sent (replies echo it that way); only checked for being an integer.
         public bool IsInteger;
+        // Allows repeated --name flags in argv (collected into a JArray) and a string or JArray of strings in structured calls.
+        // The wire type stays String: `unity mcp` builds tool schemas from it alone, and an array there has no `items`,
+        // which some MCP clients refuse. The unity CLI itself refuses a repeated flag, so its callers send one string
+        // with separators; repeated flags only come from raw argv requests.
+        public bool Repeatable;
         public string Description = "";
 
         public string WireType => IsBool ? "Boolean" : IsInteger ? "Int64" : "String";
@@ -38,9 +43,9 @@ namespace Upipe.Editor
         public int DefaultTimeoutSeconds = 60;
         public bool ReadOnly;
         public Func<JObject, object> Handler;
-        // Used instead of Handler when set: the token is cancelled when the request times out, so a handler
+        // Used instead of Handler when set: the context's token is cancelled when the request times out, so a handler
         // can stop waiting and skip work that has not started yet.
-        public Func<JObject, CancellationToken, object> CancellableHandler;
+        public Func<JObject, CommandContext, object> CancellableHandler;
 
         public string FullName => Group + " " + Name;
         public string CatalogName => Alias ?? Name;
@@ -72,7 +77,13 @@ namespace Upipe.Editor
         {
             var properties = new JObject();
             foreach (var p in Parameters)
-                properties[p.Name] = new JObject { ["type"] = p.SchemaType, ["description"] = p.Description };
+                properties[p.Name] = p.Repeatable
+                    ? new JObject
+                    {
+                        ["anyOf"] = new JArray(new JObject { ["type"] = "string" }, new JObject { ["type"] = "array", ["items"] = new JObject { ["type"] = "string" } }),
+                        ["description"] = p.Description,
+                    }
+                    : new JObject { ["type"] = p.SchemaType, ["description"] = p.Description };
             return new JObject
             {
                 ["type"] = "object",
@@ -83,11 +94,29 @@ namespace Upipe.Editor
         }
     }
 
+    // What a CancellableHandler gets besides its parameters: the token (request timeout, job cancel or timeout, server
+    // stop) and, for a detached job, its progress reporter (any thread; message null keeps the last one, percent null
+    // when only a message is given). Progress is null outside a job.
+    internal readonly struct CommandContext
+    {
+        public readonly CancellationToken Cancel;
+        public readonly Action<string, int?> Progress;
+
+        public CommandContext(CancellationToken cancel, Action<string, int?> progress = null)
+        {
+            Cancel = cancel;
+            Progress = progress;
+        }
+
+        public static implicit operator CommandContext(CancellationToken cancel) => new CommandContext(cancel);
+    }
+
     // Thrown by a handler to fail with a specific `error` and `errorDetails`, as the docs define per command.
     internal sealed class CommandFailure : Exception
     {
         public readonly string Error;
-        // Sent as the failure reply's `result` (the unity CLI drops it, raw HTTP and job clients see it), or null.
+        // Sent as a synchronous failure reply's `result` (the unity CLI drops it, raw HTTP clients see it), or null. A
+        // detached job keeps only error and errorDetails; for a test run, `test status --detail failures` has the rest.
         public JToken Result;
 
         public CommandFailure(string error, string details) : base(details)
@@ -322,7 +351,7 @@ namespace Upipe.Editor
                     result.Problems.Add(Problem("unknownName", name));
                     continue;
                 }
-                if (result.Values.ContainsKey(parameter.Name))
+                if (result.Values.ContainsKey(parameter.Name) && !parameter.Repeatable)
                 {
                     result.Problems.Add(Problem("duplicate", parameter.Name));
                     continue;
@@ -375,9 +404,27 @@ namespace Upipe.Editor
                         result.Problems.Add(Problem("unknownName", property.Name));
                         continue;
                     }
+                    // A null is a value not given, so a required parameter sent as null is reported missing.
+                    if (property.Value.Type == JTokenType.Null)
+                        continue;
                     if (result.Values.ContainsKey(parameter.Name))
                     {
                         result.Problems.Add(Problem("duplicate", parameter.Name));
+                        continue;
+                    }
+                    if (parameter.Repeatable && !IsValidRepeatableValue(property.Value))
+                    {
+                        var mismatch = Problem("typeMismatch", parameter.Name);
+                        mismatch["expectedType"] = "String[]";
+                        result.Problems.Add(mismatch);
+                        continue;
+                    }
+                    // The same rule argv applies: a boolean or integer parameter takes only a value that parses as one.
+                    if ((parameter.IsBool && !IsBoolValue(property.Value)) || (parameter.IsInteger && !IsIntegerValue(property.Value)))
+                    {
+                        var mismatch = Problem("typeMismatch", parameter.Name);
+                        mismatch["expectedType"] = parameter.WireType;
+                        result.Problems.Add(mismatch);
                         continue;
                     }
                     result.Values[parameter.Name] = property.Value;
@@ -394,6 +441,20 @@ namespace Upipe.Editor
                 ?? command.Parameters.FirstOrDefault(p => p.Name == name.Replace('_', '-'));
         }
 
+        static bool IsValidRepeatableValue(JToken value)
+        {
+            if (value.Type == JTokenType.Null || value.Type == JTokenType.String)
+                return true;
+            if (value is JArray items)
+                return items.All(item => item.Type == JTokenType.String);
+            return false;
+        }
+
+        // Exactly what ReadBool and ReadInteger accept, so a value that binds is a value the handler can read.
+        static bool IsBoolValue(JToken value) => value is JValue && bool.TryParse(value.ToString(), out _);
+
+        static bool IsIntegerValue(JToken value) => value is JValue && long.TryParse(value.ToString(), out _);
+
         static void StoreValue(BindResult result, CommandParameter parameter, string value)
         {
             if (parameter.IsInteger && !long.TryParse(value, out _))
@@ -403,19 +464,24 @@ namespace Upipe.Editor
                 result.Problems.Add(mismatch);
                 return;
             }
+            JToken bound;
             if (!parameter.IsBool)
+                bound = value;
+            else if (bool.TryParse(value, out var flag))
+                bound = flag;
+            else
             {
-                result.Values[parameter.Name] = value;
+                var problem = Problem("typeMismatch", parameter.Name);
+                problem["expectedType"] = "Boolean";
+                result.Problems.Add(problem);
                 return;
             }
-            if (bool.TryParse(value, out var flag))
+            if (parameter.Repeatable)
             {
-                result.Values[parameter.Name] = flag;
+                ((JArray)(result.Values[parameter.Name] ??= new JArray())).Add(bound);
                 return;
             }
-            var problem = Problem("typeMismatch", parameter.Name);
-            problem["expectedType"] = "Boolean";
-            result.Problems.Add(problem);
+            result.Values[parameter.Name] = bound;
         }
 
         static void AddMissingRequired(CommandEntry command, BindResult result)
@@ -443,6 +509,14 @@ namespace Upipe.Editor
             return value;
         }
 
+        public static long ReadInteger(JObject parameters, string name, long fallback, long min, long max)
+        {
+            var value = ReadInteger(parameters, name, fallback);
+            if (value < min || value > max)
+                throw CommandFailure.InvalidUsage($"{name} must be between {min} and {max}.");
+            return value;
+        }
+
         public static bool ReadBool(JObject parameters, string name, bool fallback)
         {
             var token = parameters[name];
@@ -451,6 +525,46 @@ namespace Upipe.Editor
             if (!bool.TryParse(token.ToString(), out var value))
                 throw CommandFailure.InvalidUsage($"{name} must be true or false.");
             return value;
+        }
+
+        // A Repeatable parameter's values in the order sent: argv binds a JArray of strings, structured requests a string
+        // or an array of strings. Each value goes through `split` (the command's separators), except one that holds a
+        // JSON array of strings: its elements are taken as they are, which is how a value containing a separator is sent.
+        public static List<string> ReadStrings(JObject parameters, string name, Func<string, IEnumerable<string>> split = null)
+        {
+            var values = new List<string>();
+            var token = parameters[name];
+            if (token == null || token.Type == JTokenType.Null)
+                return values;
+            foreach (var item in token is JArray items ? (IEnumerable<JToken>)items : new[] { token })
+            {
+                if (item.Type != JTokenType.String)
+                    throw CommandFailure.InvalidUsage($"{name} must be a string or an array of strings.");
+                var text = (string)item;
+                if (text.TrimStart().StartsWith("[", StringComparison.Ordinal) && TryParseStringArray(text, out var exact))
+                    values.AddRange(exact);
+                else if (split != null)
+                    values.AddRange(split(text));
+                else
+                    values.Add(text);
+            }
+            return values;
+        }
+
+        static bool TryParseStringArray(string text, out List<string> values)
+        {
+            values = null;
+            try
+            {
+                if (!(JToken.Parse(text) is JArray array) || array.Any(item => item.Type != JTokenType.String))
+                    return false;
+                values = array.Select(item => (string)item).ToList();
+                return true;
+            }
+            catch (Newtonsoft.Json.JsonException)
+            {
+                return false;
+            }
         }
     }
 }

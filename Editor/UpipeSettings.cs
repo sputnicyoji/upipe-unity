@@ -64,7 +64,8 @@ namespace Upipe.Editor
             {
                 return File.Exists(FilePath) ? File.ReadAllText(FilePath) : null;
             }
-            catch (IOException e)
+            // A file the Editor may not read keeps the default too (UnauthorizedAccessException is not an IOException).
+            catch (Exception e) when (e is IOException || e is UnauthorizedAccessException)
             {
                 Debug.LogWarning($"[Upipe] Could not read {FilePath}: {e.Message}");
                 return null;

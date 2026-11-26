@@ -13,7 +13,6 @@ namespace Upipe.Editor
     // clients can follow. Entries come from Application.logMessageReceivedThreaded (compiler messages
     // included) and survive domain reloads through SessionState; a new Editor session starts a new
     // buffer and a new session id, so an old cursor is refused with reset=true.
-    [InitializeOnLoad]
     internal static class ConsoleCommands
     {
         const string BufferKey = "Upipe.Console.Buffer";
@@ -40,37 +39,92 @@ namespace Upipe.Editor
             public string StackTrace;
         }
 
+        // Immutable pair so HTTP threads never observe a torn timestamp/payload pair across updates.
+        internal sealed class GroundTruthSnapshot
+        {
+            public readonly JObject Json;
+            public readonly DateTime SampledAt;
+
+            public GroundTruthSnapshot(JObject json, DateTime sampledAt)
+            {
+                Json = json;
+                SampledAt = sampledAt;
+            }
+        }
+
         static readonly object s_Lock = new object();
         static readonly LinkedList<Entry> s_Entries = new LinkedList<Entry>();
         static long s_LastSeq;
         // Seq of the last entry `console clear` removed; those entries were not missed, so they never count as dropped.
         static long s_ClearedThrough;
-        static readonly string s_Session;
+        static string s_Session;
+        static bool s_Restored;
+        static bool s_Attached;
 
         // Editor state sampled on the main thread and replaced whole, read by HTTP threads.
-        static volatile JObject s_GroundTruth;
-        static DateTime s_SampledAt;
+        static volatile GroundTruthSnapshot s_GroundTruth;
         static double s_NextSample;
         static MethodInfo s_GetCountsByType;
         static bool s_LookedUpCounts;
 
-        static ConsoleCommands()
+        static string EnsureSession()
         {
-            s_Session = SessionState.GetString(SessionKey, "");
-            if (s_Session.Length == 0)
+            lock (s_Lock)
             {
-                s_Session = Guid.NewGuid().ToString("N");
-                SessionState.SetString(SessionKey, s_Session);
+                if (!string.IsNullOrEmpty(s_Session))
+                    return s_Session;
+                s_Session = SessionState.GetString(SessionKey, "");
+                if (s_Session.Length == 0)
+                {
+                    s_Session = Guid.NewGuid().ToString("N");
+                    SessionState.SetString(SessionKey, s_Session);
+                }
+                return s_Session;
             }
-            Restore(SessionState.GetString(BufferKey, ""));
+        }
+
+        public static void Attach()
+        {
+            if (s_Attached)
+                return;
+            s_Attached = true;
+            EnsureSession();
+            if (!s_Restored)
+            {
+                s_Restored = true;
+                Restore(SessionState.GetString(BufferKey, ""));
+            }
+            s_NextSample = 0;
             SampleGroundTruth();
             Application.logMessageReceivedThreaded += OnLog;
-            AssemblyReloadEvents.beforeAssemblyReload += Persist;
-            EditorApplication.update += () =>
-            {
-                if (EditorApplication.timeSinceStartup >= s_NextSample)
-                    SampleGroundTruth();
-            };
+            EditorApplication.update += OnUpdate;
+            EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
+        }
+
+        public static void Detach()
+        {
+            if (!s_Attached)
+                return;
+            s_Attached = false;
+            Application.logMessageReceivedThreaded -= OnLog;
+            EditorApplication.update -= OnUpdate;
+            EditorApplication.playModeStateChanged -= OnPlayModeStateChanged;
+        }
+
+        // Leaving Play Mode clears the native flag the event's add accessor sets, so OnLog, still subscribed, gets
+        // nothing until a new subscription (measured on 2022.3.62). Entry is covered for Play Mode without a reload.
+        static void OnPlayModeStateChanged(PlayModeStateChange state)
+        {
+            if ((state != PlayModeStateChange.EnteredEditMode && state != PlayModeStateChange.EnteredPlayMode) || !s_Attached)
+                return;
+            Application.logMessageReceivedThreaded -= OnLog;
+            Application.logMessageReceivedThreaded += OnLog;
+        }
+
+        static void OnUpdate()
+        {
+            if (EditorApplication.timeSinceStartup >= s_NextSample)
+                SampleGroundTruth();
         }
 
         public static void Register()
@@ -118,6 +172,7 @@ namespace Upipe.Editor
             {
                 Group = "console",
                 Name = "write",
+                Alias = "console_write",
                 Description = "Write a message to the Editor console.",
                 Tags = new[] { "console" },
                 Parameters = new[]
@@ -178,10 +233,11 @@ namespace Upipe.Editor
             bool reset, dropped;
             long cursor;
             int[] counts;
+            var session = EnsureSession();
             lock (s_Lock)
             {
                 // A cursor from another session, or one ahead of this buffer, names different entries.
-                reset = since >= 0 && ((sinceSession != null && sinceSession != s_Session) || since > s_LastSeq);
+                reset = since >= 0 && ((sinceSession != null && sinceSession != session) || since > s_LastSeq);
                 var from = since >= 0 && !reset ? since : -1;
                 var matching = s_Entries.Where(e => e.Seq > from && Array.IndexOf(s_Levels, e.Level) >= minimum).ToList();
                 page = matching.Skip(Math.Max(0, matching.Count - (int)Math.Min(tail, int.MaxValue))).ToList();
@@ -190,19 +246,20 @@ namespace Upipe.Editor
                 cursor = s_LastSeq;
                 counts = CountByLevel();
             }
-            return Build(page, cursor, counts, reset, dropped);
+            return Build(page, cursor, session, counts, reset, dropped);
         }
 
-        static JObject Status()
+        internal static JObject Status()
         {
             long cursor;
             int[] counts;
+            var session = EnsureSession();
             lock (s_Lock)
             {
                 cursor = s_LastSeq;
                 counts = CountByLevel();
             }
-            return Build(new List<Entry>(), cursor, counts, false, false);
+            return Build(new List<Entry>(), cursor, session, counts, false, false);
         }
 
         // Called under s_Lock. Order matches s_Levels.
@@ -214,15 +271,16 @@ namespace Upipe.Editor
             return counts;
         }
 
-        static JObject Build(List<Entry> entries, long cursor, int[] counts, bool reset, bool dropped)
+        static JObject Build(List<Entry> entries, long cursor, string session, int[] counts, bool reset, bool dropped)
         {
-            var truth = (JObject)s_GroundTruth.DeepClone();
-            truth["ageMs"] = (long)(DateTime.UtcNow - s_SampledAt).TotalMilliseconds;
+            var snapshot = s_GroundTruth ?? SampleGroundTruth();
+            var truth = (JObject)snapshot.Json.DeepClone();
+            truth["ageMs"] = Math.Max(0L, (long)(DateTime.UtcNow - snapshot.SampledAt).TotalMilliseconds);
             return new JObject
             {
                 ["entries"] = new JArray(entries.Select(ToJson)),
                 ["cursor"] = cursor,
-                ["session"] = s_Session,
+                ["session"] = session,
                 ["returned"] = entries.Count,
                 ["dropped"] = dropped,
                 ["reset"] = reset,
@@ -276,12 +334,13 @@ namespace Upipe.Editor
             return text.Length <= MaxFieldChars ? text : text.Substring(0, MaxFieldChars) + " [truncated]";
         }
 
-        static void SampleGroundTruth()
+        static GroundTruthSnapshot SampleGroundTruth()
         {
             s_NextSample = EditorApplication.timeSinceStartup + SampleIntervalSeconds;
+            var sampledAt = DateTime.UtcNow;
             var truth = new JObject
             {
-                ["sampledUtc"] = DateTime.UtcNow.ToString("o"),
+                ["sampledUtc"] = sampledAt.ToString("o"),
                 ["compilationFailed"] = EditorUtility.scriptCompilationFailed,
                 ["compiling"] = EditorApplication.isCompiling,
                 ["consoleErrors"] = null,
@@ -296,8 +355,9 @@ namespace Upipe.Editor
                 truth["consoleWarnings"] = counts[1];
                 truth["consoleLogs"] = counts[2];
             }
-            s_SampledAt = DateTime.UtcNow;
-            s_GroundTruth = truth;
+            var snapshot = new GroundTruthSnapshot(truth, sampledAt);
+            s_GroundTruth = snapshot;
+            return snapshot;
         }
 
         // shortcut: the Editor console is read and cleared through the internal UnityEditor.LogEntries API. If a Unity
@@ -331,28 +391,56 @@ namespace Upipe.Editor
             }
         }
 
-        static void ClearEditorConsole()
+        internal static void ClearEditorConsole(Func<MethodInfo> resolveClear = null)
         {
-            var clear = LogEntriesMethod("Clear");
-            if (clear == null)
-                Debug.LogWarning("[Upipe] console clear: UnityEditor.LogEntries.Clear was not found; only the captured entries were cleared.");
-            else
-                clear.Invoke(null, null);
+            try
+            {
+                var clear = resolveClear != null ? resolveClear() : LogEntriesMethod("Clear");
+                if (clear == null)
+                    Debug.LogWarning("[Upipe] console clear: UnityEditor.LogEntries.Clear was not found; only the captured entries were cleared.");
+                else
+                    clear.Invoke(null, null);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[Upipe] console clear: UnityEditor.LogEntries.Clear failed ({e.Message}); only the captured entries were cleared.");
+            }
         }
 
-        static void Persist()
+        public static void Persist()
         {
-            JObject state;
+            if (s_Attached)
+                SessionState.SetString(BufferKey, Save());
+        }
+
+        // On a manual stop: a reload while the server is off persists nothing, so an earlier domain's buffer must not
+        // come back later and rewind seq below what clients saw before the stop.
+        public static void ForgetSaved() => SessionState.EraseString(BufferKey);
+
+        static string Save()
+        {
             lock (s_Lock)
             {
-                state = new JObject
+                return new JObject
                 {
                     ["lastSeq"] = s_LastSeq,
                     ["clearedThrough"] = s_ClearedThrough,
                     ["entries"] = new JArray(s_Entries.Skip(Math.Max(0, s_Entries.Count - PersistedEntries)).Select(ToJson)),
-                };
+                }.ToString(Formatting.None);
             }
-            SessionState.SetString(BufferKey, state.ToString(Formatting.None));
+        }
+
+        // Test hook: what a domain reload does to the buffer, saved and read back in place.
+        internal static void ReloadInPlace()
+        {
+            var saved = Save();
+            lock (s_Lock)
+            {
+                s_Entries.Clear();
+                s_LastSeq = 0;
+                s_ClearedThrough = 0;
+            }
+            Restore(saved);
         }
 
         static void Restore(string json)
@@ -378,6 +466,10 @@ namespace Upipe.Editor
                     }
                     s_LastSeq = (long)state["lastSeq"] + RestoreSeqMargin;
                     s_ClearedThrough = (long?)state["clearedThrough"] ?? 0;
+                    // No surviving entry (fresh session or right after `console clear`): advance cleared baseline past
+                    // the reload seq margin so the next log after reload does not read as dropped entries.
+                    if (s_Entries.Count == 0)
+                        s_ClearedThrough = s_LastSeq;
                 }
             }
             catch (Exception e)
@@ -386,13 +478,26 @@ namespace Upipe.Editor
             }
         }
 
+        // The last `max` error-level messages (Error, Exception, Assert) logged after `seq`, oldest first. Any thread.
+        internal static List<string> ErrorsSince(long seq, int max)
+        {
+            List<string> messages;
+            lock (s_Lock)
+                messages = s_Entries.Where(e => e.Seq > seq && e.Level == "error").Select(e => e.Message).ToList();
+            return messages.Skip(Math.Max(0, messages.Count - max)).ToList();
+        }
+
+        // Test hook: whether Unity's log messages reach the buffer (only while the server runs).
+        internal static bool IsAttached => s_Attached;
+
         // Test hook: the cursor and session a client would see.
         internal static (long cursor, string session) Position
         {
             get
             {
+                var session = EnsureSession();
                 lock (s_Lock)
-                    return (s_LastSeq, s_Session);
+                    return (s_LastSeq, session);
             }
         }
     }

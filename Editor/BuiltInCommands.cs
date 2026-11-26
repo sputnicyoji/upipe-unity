@@ -1,5 +1,8 @@
+using System.Collections.Generic;
+using System.Linq;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace Upipe.Editor
 {
@@ -28,7 +31,14 @@ namespace Upipe.Editor
             TestCommands.Register();
 #endif
             CaptureCommands.Register();
+            EditorQuitCommand.Register();
         }
+
+        // Main thread. The loaded scenes with unsaved changes, by path ("the untitled scene" for a new one): test run and
+        // editor quit refuse in an interactive Editor while there are any.
+        internal static List<string> DirtySceneNames() =>
+            Enumerable.Range(0, SceneManager.sceneCount).Select(SceneManager.GetSceneAt).Where(s => s.isDirty)
+                .Select(s => s.path.Length > 0 ? s.path : "the untitled scene").ToList();
 
         // Also served as GET /api/editor_status.
         public static JObject EditorStatus()

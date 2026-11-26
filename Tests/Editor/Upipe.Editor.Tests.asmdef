@@ -26,6 +26,11 @@
             "name": "com.unity.test-framework",
             "expression": "1.1.0",
             "define": "UPIPE_TEST_FRAMEWORK"
+        },
+        {
+            "name": "com.unity.test-framework",
+            "expression": "1.4.0",
+            "define": "UPIPE_TEST_CANCEL"
         }
     ],
     "noEngineReferences": false

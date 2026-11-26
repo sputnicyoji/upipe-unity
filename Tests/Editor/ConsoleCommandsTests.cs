@@ -1,5 +1,7 @@
 using System;
 using System.Linq;
+using System.Reflection;
+using System.Text.RegularExpressions;
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 using UnityEngine;
@@ -37,6 +39,22 @@ namespace Upipe.Editor.Tests
 
             CollectionAssert.AreEqual(new[] { tag + "warn", tag + "exception" }, Messages(Get(new { since = since.ToString(), level = "warn" }), tag));
             CollectionAssert.AreEqual(new[] { tag + "exception" }, Messages(Get(new { since = since.ToString(), tail = "1" }), tag));
+        }
+
+        [Test]
+        public void ErrorsSinceKeepsTheLastErrorLevelMessages()
+        {
+            var tag = NewTag();
+            var since = ConsoleCommands.Position.cursor;
+            ConsoleCommands.Add(LogType.Error, tag + "error", "");
+            ConsoleCommands.Add(LogType.Log, tag + "log", "");
+            ConsoleCommands.Add(LogType.Warning, tag + "warn", "");
+            ConsoleCommands.Add(LogType.Exception, tag + "exception", "");
+            ConsoleCommands.Add(LogType.Assert, tag + "assert", "");
+            string[] Ours(int max) => ConsoleCommands.ErrorsSince(since, max).Where(m => m.StartsWith(tag, StringComparison.Ordinal)).ToArray();
+            CollectionAssert.AreEqual(new[] { tag + "error", tag + "exception", tag + "assert" }, Ours(10));
+            CollectionAssert.AreEqual(new[] { tag + "exception", tag + "assert" }, Ours(2));
+            CollectionAssert.IsEmpty(ConsoleCommands.ErrorsSince(ConsoleCommands.Position.cursor, 10));
         }
 
         [Test]
@@ -106,9 +124,71 @@ namespace Upipe.Editor.Tests
             Assert.IsFalse((bool)follow["dropped"], "cleared entries were not missed");
         }
 
+        // A reload keeps the newest entries, the clear baseline and the session; numbering restarts past what the old
+        // domain may have handed out, so an old cursor still follows without skipping or re-reading anything.
+        [Test]
+        public void CursorAndClearBaselineSurviveAReload()
+        {
+            var tag = NewTag();
+            var start = ConsoleCommands.Position.cursor;
+            ConsoleCommands.Add(LogType.Log, tag + "cleared", "");
+            ConsoleCommands.Clear();
+            ConsoleCommands.Add(LogType.Log, tag + "kept", "");
+            var (cursor, session) = ConsoleCommands.Position;
+
+            ConsoleCommands.ReloadInPlace();
+            Assert.Greater(ConsoleCommands.Position.cursor, cursor);
+            Assert.AreEqual(session, ConsoleCommands.Position.session);
+            ConsoleCommands.Add(LogType.Log, tag + "after", "");
+
+            var follow = (JObject)ConsoleCommands.Get(new JObject { ["since"] = cursor.ToString(), ["since-session"] = session });
+            Assert.IsFalse((bool)follow["reset"]);
+            CollectionAssert.AreEqual(new[] { tag + "after" }, Messages(follow, tag));
+            var fromStart = Get(new { since = start.ToString() });
+            CollectionAssert.AreEqual(new[] { tag + "kept", tag + "after" }, Messages(fromStart, tag));
+            Assert.IsFalse((bool)fromStart["dropped"], "entries a clear removed were not missed, before or after the reload");
+        }
+
+        [Test]
+        public void ReloadAfterClearWithEmptyBufferDoesNotReportDroppedAndForgetSavedClearsState()
+        {
+            var tag = NewTag();
+            ConsoleCommands.Add(LogType.Log, tag + "old", "");
+            ConsoleCommands.Clear();
+            var (clearedAt, session) = ConsoleCommands.Position;
+
+            ConsoleCommands.ReloadInPlace();
+            ConsoleCommands.Add(LogType.Log, tag + "fresh", "");
+            var follow = (JObject)ConsoleCommands.Get(new JObject { ["since"] = clearedAt.ToString(), ["since-session"] = session });
+            CollectionAssert.AreEqual(new[] { tag + "fresh" }, Messages(follow, tag));
+            Assert.IsFalse((bool)follow["reset"]);
+            Assert.IsFalse((bool)follow["dropped"], "reloading an empty/cleared buffer must not read the seq margin as dropped");
+
+            ConsoleCommands.Persist();
+            if (ConsoleCommands.IsAttached)
+                StringAssert.Contains(tag + "fresh", UnityEditor.SessionState.GetString("Upipe.Console.Buffer", ""));
+            ConsoleCommands.ForgetSaved();
+            Assert.AreEqual("", UnityEditor.SessionState.GetString("Upipe.Console.Buffer", ""));
+        }
+
+        [Test]
+        public void EntriesEvictedPastCapacityReadAsDropped()
+        {
+            var tag = NewTag();
+            var since = ConsoleCommands.Position.cursor;
+            ConsoleCommands.Add(LogType.Log, tag + "first", "");
+            for (var i = 0; i < 2005; i++) // capacity is 2000
+                ConsoleCommands.Add(LogType.Log, tag + i, "");
+            var reply = Get(new { since = since.ToString(), tail = "5000" });
+            Assert.IsTrue((bool)reply["dropped"]);
+            CollectionAssert.DoesNotContain(Messages(reply, tag), tag + "first");
+            Assert.AreEqual(tag + "2004", Messages(reply, tag).Last());
+        }
+
         [Test]
         public void WriteLogsAtTheRequestedLevel()
         {
+            Assume.That(ConsoleCommands.IsAttached, Is.True, "the Upipe server is disabled here, so Unity's log messages are not captured");
             var tag = NewTag();
             var since = ConsoleCommands.Position.cursor;
             ConsoleCommands.Write(new JObject { ["message"] = tag + "plain" });
@@ -122,6 +202,25 @@ namespace Upipe.Editor.Tests
 
             Assert.Throws<CommandFailure>(() => ConsoleCommands.Write(new JObject { ["message"] = tag + "bad", ["level"] = "info" }));
             CollectionAssert.DoesNotContain(Messages(Get(new { since = since.ToString() }), tag), tag + "bad");
+        }
+
+        static void ThrowForClearTest() => throw new InvalidOperationException("simulated LogEntries failure");
+
+        [Test]
+        public void ClearEditorConsoleLogsWarningInsteadOfThrowingOnReflectionFailure()
+        {
+            LogAssert.Expect(LogType.Warning, new Regex("LogEntries\\.Clear was not found"));
+            ConsoleCommands.ClearEditorConsole(() => null);
+
+            LogAssert.Expect(LogType.Warning, new Regex("LogEntries\\.Clear failed"));
+            ConsoleCommands.ClearEditorConsole(() => typeof(ConsoleCommandsTests).GetMethod(nameof(ThrowForClearTest), BindingFlags.Static | BindingFlags.NonPublic));
+        }
+
+        [Test]
+        public void StatusReportsNonNegativeGroundTruthAgeMs()
+        {
+            var status = ConsoleCommands.Status();
+            Assert.GreaterOrEqual((long)status["groundTruth"]["ageMs"], 0);
         }
     }
 }

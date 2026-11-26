@@ -64,20 +64,21 @@ namespace Upipe.Editor
             var usings = new List<string>();
             var types = new List<string>();
 
+            // Only the code moves: the comments and preprocessor lines before it stay in the body, which keeps the body's
+            // #if/#endif balanced, and the moved text is wrapped in the conditions open where it was written.
             foreach (var chunk in scan.Chunks)
             {
-                var text = code.Substring(chunk.Start, chunk.End - chunk.Start);
                 var first = FirstCode(code, chunk.Start, chunk.End);
                 var bare = code.Substring(first, chunk.End - first);
                 if (s_UsingDirective.IsMatch(StripComments(bare)))
                 {
-                    usings.Add(LineDirective(code, first) + StripComments(bare).Trim());
-                    Blank(body, chunk);
+                    usings.Add(Conditioned(code, first, LineDirective(code, first) + StripComments(bare).Trim()));
+                    Blank(body, first, chunk.End);
                 }
                 else if (s_TypeDeclaration.IsMatch(StripComments(bare)))
                 {
-                    types.Add(LineDirective(code, first) + new string(' ', Column(code, first)) + bare);
-                    Blank(body, chunk);
+                    types.Add(Conditioned(code, first, LineDirective(code, first) + new string(' ', Column(code, first)) + bare));
+                    Blank(body, first, chunk.End);
                 }
             }
 
@@ -135,11 +136,40 @@ namespace Upipe.Editor
             return position < lineStart ? 0 : position - lineStart;
         }
 
-        static void Blank(StringBuilder body, Chunk chunk)
+        static void Blank(StringBuilder body, int start, int end)
         {
-            for (var i = chunk.Start; i < chunk.End; i++)
+            for (var i = start; i < end; i++)
                 if (body[i] != '\n')
                     body[i] = ' ';
+        }
+
+        // `text` inside the #if / #elif / #else lines still open at `position` (outermost first) and their #endifs.
+        static string Conditioned(string code, int position, string text)
+        {
+            var open = new List<List<string>>();
+            var i = 0;
+            while (i < position)
+            {
+                var trivia = SkipTrivia(code, i);
+                if (trivia > i)
+                {
+                    var directive = code[i] == '#' ? Regex.Match(code.Substring(i, trivia - i), @"^#\s*(\w+)").Groups[1].Value : "";
+                    if (directive == "if")
+                        open.Add(new List<string> { code.Substring(i, trivia - i).Trim() });
+                    else if ((directive == "elif" || directive == "else") && open.Count > 0)
+                        open[open.Count - 1].Add(code.Substring(i, trivia - i).Trim());
+                    else if (directive == "endif" && open.Count > 0)
+                        open.RemoveAt(open.Count - 1);
+                    i = trivia;
+                    continue;
+                }
+                var literal = SkipLiteral(code, i);
+                i = literal > i ? literal : i + 1;
+            }
+            if (open.Count == 0)
+                return text;
+            return string.Concat(open.SelectMany(lines => lines).Select(line => line + "\n")) + text +
+                string.Concat(Enumerable.Repeat("\n#endif", open.Count));
         }
 
         static string StripComments(string text)
@@ -178,7 +208,7 @@ namespace Upipe.Editor
         }
 
         // Past whitespace, a comment or a preprocessor line at `i`; returns `i` when there is none.
-        static int SkipTrivia(string code, int i)
+        internal static int SkipTrivia(string code, int i)
         {
             if (i >= code.Length)
                 return i;
@@ -209,7 +239,7 @@ namespace Upipe.Editor
         }
 
         // Past a string or char literal starting at `i` ("", @"", $"", $@"", @$"", ''); returns `i` when there is none.
-        static int SkipLiteral(string code, int i)
+        internal static int SkipLiteral(string code, int i)
         {
             var j = i;
             var verbatim = false;
@@ -309,7 +339,7 @@ namespace Upipe.Editor
 
         static readonly HashSet<string> s_StatementOwners = new HashSet<string>
         {
-            "if", "for", "foreach", "while", "using", "lock", "switch", "catch", "fixed",
+            "if", "for", "foreach", "while", "using", "lock", "switch", "catch", "fixed", "when",
         };
 
         static readonly HashSet<string> s_BlockKeywords = new HashSet<string>
@@ -319,7 +349,7 @@ namespace Upipe.Editor
 
         static readonly HashSet<string> s_ExpressionPrefixes = new HashSet<string>
         {
-            "new", "]", ">", "=", "(", ",", "return", "switch", "with", "?", ":", "??", "[", "await", "yield",
+            "new", "]", ">", "=", "(", ",", "return", "switch", "with", "?", ":", "??", "[", "await", "yield", "is",
         };
 
         static readonly HashSet<string> s_Continuations = new HashSet<string> { "else", "catch", "finally", "while" };
@@ -330,9 +360,9 @@ namespace Upipe.Editor
         {
             var scan = new Scan();
             var braces = new Stack<Brace>();
-            var parenOwners = new Stack<(string owner, string beforeOwner)>();
+            var parenOwners = new Stack<(string owner, bool afterNew)>();
             var tokens = new List<string>(); // significant tokens so far, for looking back
-            (string owner, string beforeOwner) lastClosedParen = ("", "");
+            (string owner, bool afterNew) lastClosedParen = ("", false);
             var start = 0;
             var i = 0;
             while (i < code.Length)
@@ -381,18 +411,21 @@ namespace Upipe.Editor
                 switch (c)
                 {
                     case '(':
-                        parenOwners.Push((Last(tokens, 0), Last(tokens, 1)));
+                        parenOwners.Push((Last(tokens, 0), OpensObjectCreation(tokens)));
                         break;
                     case ')':
-                        lastClosedParen = parenOwners.Count > 0 ? parenOwners.Pop() : ("", "");
+                        lastClosedParen = parenOwners.Count > 0 ? parenOwners.Pop() : ("", false);
                         break;
                     case '{':
-                        braces.Push(Classify(code, start, i, tokens, lastClosedParen));
+                        braces.Push(Classify(code, start, i, tokens, lastClosedParen,
+                            braces.Count > 0 ? braces.Peek() : Brace.Statement, parenOwners.Count > 0));
                         break;
                     case '}':
                         var closed = braces.Count > 0 ? braces.Pop() : Brace.Statement;
-                        if (braces.Count == 0 && closed != Brace.Expression && closed != Brace.Lambda &&
-                            !s_Continuations.Contains(NextWord(code, i + 1)))
+                        // Like ';', a '}' inside parentheses (a delegate passed to a call) never ends a statement, and
+                        // nothing continues a type the way else/catch/finally/while continue a block.
+                        if (braces.Count == 0 && parenOwners.Count == 0 && closed != Brace.Expression && closed != Brace.Lambda &&
+                            (closed == Brace.Type || !s_Continuations.Contains(NextWord(code, i + 1))))
                         {
                             scan.Chunks.Add(new Chunk { Start = start, End = i + 1 });
                             start = i + 1;
@@ -424,39 +457,167 @@ namespace Upipe.Editor
             return scan;
         }
 
-        static Brace Classify(string code, int chunkStart, int brace, List<string> tokens, (string owner, string beforeOwner) lastClosedParen)
+        static Brace Classify(string code, int chunkStart, int brace, List<string> tokens, (string owner, bool afterNew) lastClosedParen,
+            Brace enclosing, bool inParentheses)
         {
             var first = FirstCode(code, chunkStart, brace);
             if (s_TypeDeclaration.IsMatch(StripComments(code.Substring(first, brace - first))))
                 return Brace.Type;
             var previous = Last(tokens, 0);
+            if (!inParentheses && IsGenericConstraintClause(tokens))
+                return Brace.Function;
             if (previous == ")")
             {
-                var (owner, beforeOwner) = lastClosedParen;
+                var (owner, afterNew) = lastClosedParen;
                 if (s_StatementOwners.Contains(owner))
                     return Brace.Statement;
-                if (beforeOwner == "new" || owner == ">" || owner == "]")
-                    return Brace.Expression; // new Foo(1) { A = 2 }
-                return IsWord(owner) ? Brace.Function : Brace.Statement;
+                if (owner == "delegate")
+                    return Brace.Lambda; // delegate (int a) { ... }
+                if (afterNew || owner == "]")
+                    return Brace.Expression; // new A.Foo(1) { B = 2 }, new List<int>(1) { 2 }, new() { B = 2 }
+                if (owner == ">" || IsWord(owner))
+                    return Brace.Function;
+                return Brace.Statement;
             }
-            if (previous == "=>")
+            if (previous == "=>" || previous == "delegate")
                 return Brace.Lambda;
             if (s_BlockKeywords.Contains(previous) || previous == "" || previous == ";" || previous == "}" || previous == "{")
                 return Brace.Statement;
-            if (s_ExpressionPrefixes.Contains(previous))
+            if (previous == ":" && enclosing == Brace.Statement && !inParentheses)
+                return Brace.Statement; // case 1: { ... } or a labelled block
+            if (s_ExpressionPrefixes.Contains(previous) || IsPatternBrace(tokens) || enclosing == Brace.Expression)
                 return Brace.Expression;
-            if (IsWord(previous) && Last(tokens, 1) == "new")
-                return Brace.Expression; // new Foo { A = 1 }
+            if (IsWord(previous) && AfterNew(tokens, 0))
+                return Brace.Expression; // new A.Foo { B = 1 }
             if (IsWord(previous))
                 return Brace.Statement;
             return Brace.Expression;
+        }
+
+        // Whether the '(' about to open follows `new A.Foo`, `new A.Foo<T>`, or a target-typed `new`, so that a '{'
+        // after its ')' is an initializer. `new()` after ':' or ',' is the constraint of a generic local function.
+        static bool OpensObjectCreation(List<string> tokens)
+        {
+            var owner = Last(tokens, 0);
+            if (owner == "new")
+                return Last(tokens, 1) != ":" && Last(tokens, 1) != ",";
+            return (owner == ">" || IsWord(owner)) && AfterNew(tokens, 0);
+        }
+
+        // Whether the type name ending `back` tokens from the end (with optional `<...>` and `.` qualifiers) follows `new`.
+        static bool AfterNew(List<string> tokens, int back)
+        {
+            while (true)
+            {
+                if (Last(tokens, back) == ">")
+                {
+                    back = SkipBracketsBack(tokens, back, "<", ">");
+                    if (back < 0)
+                        return false;
+                }
+                if (!IsWord(Last(tokens, back)))
+                    return false;
+                if (Last(tokens, back + 1) == ".")
+                {
+                    back += 2;
+                    continue;
+                }
+                return Last(tokens, back + 1) == "new";
+            }
+        }
+
+        // Walks backward over balanced `open ... close` ending at `back` from the end, returning the index before `open`.
+        static int SkipBracketsBack(List<string> tokens, int back, string open, string close)
+        {
+            var depth = 0;
+            while (back < tokens.Count)
+            {
+                var token = Last(tokens, back);
+                if (token == close)
+                    depth++;
+                else if (token == open && --depth == 0)
+                    return back + 1;
+                else if (token == ";" || token == "{" || token == "}" || token == "=>" || token == "=")
+                    return -1;
+                back++;
+            }
+            return -1;
+        }
+
+        // Generic local function constraint clause (`... ) where T : class/struct/Base/IComparable<T>/new() {`).
+        static bool IsGenericConstraintClause(List<string> tokens)
+        {
+            var parenDepth = 0;
+            for (var idx = tokens.Count - 1; idx >= 0; idx--)
+            {
+                var token = tokens[idx];
+                if (token == ")")
+                {
+                    parenDepth++;
+                    continue;
+                }
+                if (token == "(")
+                {
+                    if (parenDepth == 0)
+                        return false;
+                    parenDepth--;
+                    continue;
+                }
+                if (parenDepth > 0)
+                    continue;
+                if (token == "{" || token == "}" || token == ";" || token == "=>" || token == "=" || token == "?")
+                    return false;
+                if (token == "where" && idx > 0 && tokens[idx - 1] == ")" &&
+                    idx + 2 < tokens.Count && IsWord(tokens[idx + 1]) && tokens[idx + 2] == ":")
+                    return true;
+            }
+            return false;
+        }
+
+        // Property pattern `{ ... }` in `s is { ... }`, `s is not { ... }`, `s is { } and/or { }`, `s is Ns.Type<T> { ... }`,
+        // or `case Type { ... }:`.
+        static bool IsPatternBrace(List<string> tokens)
+        {
+            var token = Last(tokens, 0);
+            if (token == "is" || token == "and" || token == "or")
+                return true;
+            if (token == "not")
+            {
+                var prev = Last(tokens, 1);
+                return prev == "is" || prev == "not" || prev == "and" || prev == "or" || prev == "case" || prev == "(";
+            }
+            if (token != ">" && !IsWord(token))
+                return false;
+            var back = 0;
+            while (true)
+            {
+                if (Last(tokens, back) == ">")
+                {
+                    back = SkipBracketsBack(tokens, back, "<", ">");
+                    if (back < 0)
+                        return false;
+                }
+                if (!IsWord(Last(tokens, back)))
+                    return false;
+                back++;
+                if (Last(tokens, back) == ".")
+                {
+                    back++;
+                    continue;
+                }
+                break;
+            }
+            if (Last(tokens, back) == "not")
+                back++;
+            var keyword = Last(tokens, back);
+            return keyword == "is" || keyword == "case" || keyword == "and" || keyword == "or";
         }
 
         static bool IsWord(string token) => token.Length > 0 && (char.IsLetter(token[0]) || token[0] == '_' || token[0] == '@');
 
         static string Last(List<string> tokens, int back) => tokens.Count > back ? tokens[tokens.Count - 1 - back] : "";
 
-        static int SkipAllTrivia(string code, int i)
+        internal static int SkipAllTrivia(string code, int i)
         {
             while (true)
             {

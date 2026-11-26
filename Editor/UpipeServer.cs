@@ -1,9 +1,13 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Sockets;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -20,7 +24,8 @@ namespace Upipe.Editor
     [InitializeOnLoad]
     internal static class UpipeServer
     {
-        public const string Version = "0.1.0";
+        internal const string FallbackVersion = "0.3.2";
+        public static string Version { get; private set; } = FallbackVersion;
 
         const int FirstPort = 7800;
         const int LastPort = 7849;
@@ -29,15 +34,46 @@ namespace Upipe.Editor
         // Each waiting exec holds a thread-pool thread; past this many, new ones are refused.
         const int MaxExecInFlight = 64;
         const int ReloadDrainMilliseconds = 500;
+        // On Windows the old domain's listening socket stays bound for up to ~200 ms after a reload (measured), and a
+        // moved port strands a CLI polling the old one (`unity recompile` waits out its timeout), so wait for it.
+        const int PreferredPortWaitMilliseconds = 2000;
         const string TokenKey = "Upipe.Token";
         const string PortKey = "Upipe.Port";
         const string StartedAtKey = "Upipe.StartedAt";
+#if UPIPE_TEST_FRAMEWORK
+        static readonly string[] s_Capabilities = { "exec.argv", "tests.camelCase" };
+#else
         static readonly string[] s_Capabilities = { "exec.argv" };
+#endif
         static readonly string[] s_Details = { "full", "compact", "tags", "groups" };
         static readonly string[] s_Sorts = { "name", "package" };
         static readonly string[] s_Orders = { "asc", "desc" };
 
         public static readonly string ProjectPath;
+
+        const uint HandleFlagInherit = 1;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern uint GetLongPathNameW(string shortPath, StringBuilder longPath, uint bufferLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool SetHandleInformation(IntPtr hObject, uint dwMask, uint dwFlags);
+
+        // On Windows, temp paths can arrive in 8.3 short form while Roslyn expands `#line` paths to long names in
+        // diagnostics and Portable PDBs. Expanding existing paths keeps diagnostics and --extra-files matching aligned.
+        internal static string CanonicalizePath(string fullPath)
+        {
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows) || string.IsNullOrEmpty(fullPath))
+                return fullPath;
+            var buffer = new StringBuilder(260);
+            var length = GetLongPathNameW(fullPath, buffer, (uint)buffer.Capacity);
+            if (length >= buffer.Capacity)
+            {
+                buffer = new StringBuilder((int)length);
+                length = GetLongPathNameW(fullPath, buffer, (uint)buffer.Capacity);
+            }
+            return length > 0 && length < buffer.Capacity ? buffer.ToString() : fullPath;
+        }
 
         // Absolute, or relative to the project root. A path written on Windows (Scripts\Tool.cs) works on macOS too,
         // where a backslash is never a separator.
@@ -45,45 +81,50 @@ namespace Upipe.Editor
         {
             if (Path.DirectorySeparatorChar == '/')
                 path = path.Replace('\\', '/');
-            return Path.GetFullPath(Path.IsPathRooted(path) ? path : Path.Combine(ProjectPath, path));
+            return CanonicalizePath(Path.GetFullPath(Path.IsPathRooted(path) ? path : Path.Combine(ProjectPath, path)));
         }
+        // How this platform's file systems compare paths: Windows and macOS ignore case by default, Linux does not.
+        internal static readonly StringComparer PathComparer =
+            RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+        internal static bool PathsIgnoreCase => PathComparer == StringComparer.OrdinalIgnoreCase;
+
         public static readonly string UnityVersion;
         public static readonly string Mode;
 
         static readonly int s_Pid;
-        static readonly string s_Token;
-        static readonly string s_StartedAt;
+        static string s_Token;
+        static string s_StartedAt;
         static readonly string s_DescriptorPath;
         static readonly object s_Lock = new object();
+        static readonly object s_DescriptorLock = new object();
+        static readonly Type s_MonoEndPointManager = typeof(HttpListener).Assembly.GetType("System.Net.EndPointManager");
         static volatile HttpListener s_Listener;
-        static int s_Port;
+        static volatile int s_Port;
+        static object s_LocalhostPrefix;
         static Timer s_Heartbeat;
-        static string s_LastHeartbeat;
+        static volatile string s_LastHeartbeat;
         static int s_ExecInFlight;
+        static int s_RequestsInFlight;
+        // HTTP requests being answered right now, so `editor quit` can wait for its own reply to go out.
+        internal static int RequestsInFlight => Volatile.Read(ref s_RequestsInFlight);
+        static int s_LiveJobThreads;
+        static CancellationTokenSource s_Shutdown;
+        static bool s_LifecycleHooked;
 
         static UpipeServer()
         {
-            MainThreadQueue.Initialize();
-            ProjectPath = Path.GetDirectoryName(Application.dataPath);
+            var packageVersion = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(UpipeServer).Assembly)?.version;
+            if (!string.IsNullOrEmpty(packageVersion))
+                Version = packageVersion;
+
+            ProjectPath = CanonicalizePath(Path.GetDirectoryName(Application.dataPath));
             UnityVersion = Application.unityVersion;
             Mode = Application.isBatchMode ? "batchmode" : "editor";
             s_Pid = System.Diagnostics.Process.GetCurrentProcess().Id;
-            s_Token = GetOrCreateToken();
-            s_StartedAt = SessionState.GetString(StartedAtKey, "");
-            if (s_StartedAt.Length == 0)
-            {
-                s_StartedAt = DateTime.UtcNow.ToString("o");
-                SessionState.SetString(StartedAtKey, s_StartedAt);
-            }
             s_DescriptorPath = DescriptorFile.PathFor(ProjectPath);
 
-            // Commands register even while the server is off: the menu can start it later, and tests use the registry.
+            // Commands register in memory even while the server is off: the menu can start it later, and unit tests read the registry.
             BuiltInCommands.Register();
-            JobManager.Live.Initialize();
-            // Before Stop, which fails the queued work: the job table is saved first, unfinished jobs as interrupted.
-            AssemblyReloadEvents.beforeAssemblyReload += JobManager.Live.SaveForReload;
-            AssemblyReloadEvents.beforeAssemblyReload += Stop;
-            EditorApplication.quitting += Stop;
             if (UpipeSettings.IsEnabled())
                 Start();
             else
@@ -95,6 +136,80 @@ namespace Upipe.Editor
 
         public static bool IsRunning => s_Listener != null;
 
+        static void EnsureSessionMetadata()
+        {
+            if (string.IsNullOrEmpty(s_Token))
+                s_Token = GetOrCreateToken();
+            if (string.IsNullOrEmpty(s_StartedAt))
+            {
+                s_StartedAt = SessionState.GetString(StartedAtKey, "");
+                if (s_StartedAt.Length == 0)
+                {
+                    s_StartedAt = DateTime.UtcNow.ToString("o");
+                    SessionState.SetString(StartedAtKey, s_StartedAt);
+                }
+            }
+        }
+
+        static void HookLifecycle()
+        {
+            if (s_LifecycleHooked)
+                return;
+            s_LifecycleHooked = true;
+            AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
+            EditorApplication.quitting += OnEditorQuitting;
+        }
+
+        static void UnhookLifecycle()
+        {
+            if (!s_LifecycleHooked)
+                return;
+            s_LifecycleHooked = false;
+            AssemblyReloadEvents.beforeAssemblyReload -= OnBeforeAssemblyReload;
+            EditorApplication.quitting -= OnEditorQuitting;
+        }
+
+        static void AttachModules()
+        {
+            JobManager.Live.Resume();
+            MainThreadQueue.Attach();
+            ConsoleCommands.Attach();
+            RecompileCommands.Attach();
+            AutoTick.Attach();
+            PlayModeCommands.Attach();
+#if UPIPE_TEST_FRAMEWORK
+            TestCommands.Attach();
+#endif
+            EditorQuitCommand.Attach();
+        }
+
+        static void DetachModules(bool forReload, bool serverStopped)
+        {
+            CscCompiler.Detach();
+            ScriptEvalCommand.Detach();
+            MainThreadQueue.Detach(forReload);
+            ConsoleCommands.Detach();
+            RecompileCommands.Detach();
+            AutoTick.Detach();
+            PlayModeCommands.Detach();
+#if UPIPE_TEST_FRAMEWORK
+            TestCommands.Detach(serverStopped);
+#endif
+        }
+
+        static void OnBeforeAssemblyReload()
+        {
+            MainThreadQueue.MarkDomainReloading();
+            JobManager.Live.SaveForReload();
+            ConsoleCommands.Persist();
+#if UPIPE_TEST_FRAMEWORK
+            TestCommands.SaveForReload();
+#endif
+            Stop(forReload: true);
+        }
+
+        static void OnEditorQuitting() => Stop(forReload: false);
+
         // Starts or stops the server to match the setting, without restarting the Editor.
         public static void ApplySettings()
         {
@@ -103,26 +218,38 @@ namespace Upipe.Editor
                 Start();
             else if (!enabled && IsRunning)
             {
-                Stop();
+                Stop(forReload: false);
                 Debug.Log("[Upipe] Server stopped; descriptor removed.");
             }
         }
 
         public static void Start()
         {
+            int port;
             lock (s_Lock)
             {
                 if (s_Listener != null)
                     return;
+                EnsureSessionMetadata();
+                s_Shutdown = new CancellationTokenSource();
+                HookLifecycle();
+                AttachModules();
                 if (!StartListener())
                 {
+                    var failedShutdown = s_Shutdown;
+                    s_Shutdown = null;
+                    UnhookLifecycle();
+                    // Never started: a restored test run is not ended, and the saved copies stay for the next domain.
+                    DetachModules(forReload: false, serverStopped: false);
+                    CancelQuietly(failedShutdown);
                     Debug.LogError($"[Upipe] No free port in {FirstPort}-{LastPort}; server not started.");
                     return;
                 }
-                Publish();
+                port = s_Port;
                 s_Heartbeat = new Timer(_ => Publish(), null, HeartbeatMilliseconds, HeartbeatMilliseconds);
             }
-            Debug.Log($"[Upipe] HTTP server listening on 127.0.0.1:{s_Port}");
+            Publish();
+            Debug.Log($"[Upipe] HTTP server listening on 127.0.0.1:{port}");
         }
 
         // Kept in SessionState so the token survives domain reloads within one Editor session.
@@ -148,24 +275,115 @@ namespace Upipe.Editor
 
             foreach (var port in candidates)
             {
-                var listener = new HttpListener();
-                listener.Prefixes.Add($"http://127.0.0.1:{port}/");
-                try
-                {
-                    listener.Start();
-                }
-                catch (Exception)
-                {
-                    listener.Close();
+                var waitUntil = port == preferred ? DateTime.UtcNow.AddMilliseconds(PreferredPortWaitMilliseconds) : DateTime.MinValue;
+                HttpListener listener;
+                object localhostPrefix = null;
+                while ((listener = TryListen(port, out localhostPrefix)) == null && DateTime.UtcNow < waitUntil)
+                    Thread.Sleep(20);
+                if (listener == null)
                     continue;
-                }
                 s_Listener = listener;
                 s_Port = port;
+                s_LocalhostPrefix = localhostPrefix;
                 SessionState.SetInt(PortKey, port);
                 new Thread(() => AcceptLoop(listener)) { IsBackground = true, Name = "Upipe.Accept" }.Start();
                 return true;
             }
             return false;
+        }
+
+        // A started listener on the port, or null if it is taken.
+        static HttpListener TryListen(int port, out object localhostPrefix)
+        {
+            localhostPrefix = null;
+            var listener = new HttpListener();
+            listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+            if (s_MonoEndPointManager == null)
+                listener.Prefixes.Add($"http://localhost:{port}/");
+            try
+            {
+                listener.Start();
+                localhostPrefix = ConfigureMonoLoopbackListener(listener, port);
+                return listener;
+            }
+            catch (Exception)
+            {
+                RemoveMonoLoopbackPrefix(listener, port, localhostPrefix);
+                localhostPrefix = null;
+                try
+                {
+                    listener.Abort();
+                }
+                catch (Exception)
+                {
+                    // already closed
+                }
+                return null;
+            }
+        }
+
+        static object GetMonoLoopbackEndPointListener(int port)
+        {
+            var map = s_MonoEndPointManager?.GetField("ip_to_endpoints", BindingFlags.Static | BindingFlags.NonPublic)?.GetValue(null) as Hashtable;
+            if (map == null)
+                return null;
+            lock (map)
+            {
+                var ports = map[IPAddress.Loopback] as Hashtable;
+                return ports?[port];
+            }
+        }
+
+        static object ConfigureMonoLoopbackListener(HttpListener listener, int port)
+        {
+            if (s_MonoEndPointManager == null)
+                return null;
+            var endpointListener = GetMonoLoopbackEndPointListener(port);
+            if (endpointListener == null)
+                return null;
+            try
+            {
+                // Prevent child processes spawned with UseShellExecute=false from inheriting the listening socket handle
+                // on Windows (otherwise a child process keeps the port bound across domain reloads).
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    var sock = endpointListener.GetType().GetField("sock", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(endpointListener) as Socket;
+                    if (sock != null)
+                        SetHandleInformation(sock.Handle, HandleFlagInherit, 0);
+                }
+                // Mono binds http://localhost:<port>/ only to ::1 (Dns.GetHostAddresses("localhost")[0]), leaving 127.0.0.1
+                // without a localhost prefix. Registering localhost directly on the IPv4 EndPointListener accepts
+                // `Host: localhost:<port>` when the unity CLI falls back to localhost after ECONNREFUSED on reload.
+                var prefixType = typeof(HttpListener).Assembly.GetType("System.Net.ListenerPrefix");
+                if (prefixType == null)
+                    return null;
+                var prefix = Activator.CreateInstance(prefixType, new object[] { $"http://localhost:{port}/" });
+                var addPrefix = endpointListener.GetType().GetMethod("AddPrefix", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                addPrefix?.Invoke(endpointListener, new object[] { prefix, listener });
+                return prefix;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        static void RemoveMonoLoopbackPrefix(HttpListener listener, int port, object localhostPrefix)
+        {
+            if (listener == null || localhostPrefix == null || s_MonoEndPointManager == null)
+                return;
+            try
+            {
+                var endpointListener = GetMonoLoopbackEndPointListener(port);
+                if (endpointListener == null)
+                    return;
+                var removePrefix = endpointListener.GetType().GetMethod("RemovePrefix", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                removePrefix?.Invoke(endpointListener, new object[] { localhostPrefix, listener });
+            }
+            catch (Exception)
+            {
+                // already closed or unregistered
+            }
         }
 
         static void AcceptLoop(HttpListener listener)
@@ -192,59 +410,107 @@ namespace Upipe.Editor
 
         static void Publish()
         {
+            int port;
+            string token;
+            string startedAt;
             lock (s_Lock)
             {
                 if (s_Listener == null)
                     return;
-                s_LastHeartbeat = DateTime.UtcNow.ToString("o");
-                DescriptorFile.Write(s_DescriptorPath, new JObject
-                {
-                    ["pid"] = s_Pid,
-                    ["port"] = s_Port,
-                    ["projectPath"] = ProjectPath,
-                    ["projectName"] = Path.GetFileName(ProjectPath),
-                    ["unityVersion"] = UnityVersion,
-                    ["mode"] = Mode,
-                    ["startedAt"] = s_StartedAt,
-                    ["lastHeartbeat"] = s_LastHeartbeat,
-                    ["evalToken"] = s_Token,
-                    ["capabilities"] = new JArray(s_Capabilities),
-                    ["role"] = "main",
-                    ["instanceName"] = "Main Editor",
-                    ["endpoints"] = new JArray(new JObject { ["type"] = "http", ["port"] = s_Port.ToString() }),
-                });
+                port = s_Port;
+                token = s_Token;
+                startedAt = s_StartedAt;
+            }
+            var now = DateTime.UtcNow.ToString("o");
+            var descriptor = new JObject
+            {
+                ["pid"] = s_Pid,
+                ["port"] = port,
+                ["projectPath"] = ProjectPath,
+                ["projectName"] = Path.GetFileName(ProjectPath),
+                ["unityVersion"] = UnityVersion,
+                ["mode"] = Mode,
+                ["startedAt"] = startedAt,
+                ["lastHeartbeat"] = now,
+                ["evalToken"] = token,
+                ["capabilities"] = new JArray(s_Capabilities),
+                ["role"] = "main",
+                ["instanceName"] = "Main Editor",
+                ["endpoints"] = new JArray(new JObject { ["type"] = "http", ["port"] = port.ToString() }),
+            };
+            lock (s_DescriptorLock)
+            {
+                if (!IsRunning)
+                    return;
+                // Reported only once written: a heartbeat the CLI cannot read must not look fresh in /api/status.
+                if (DescriptorFile.Write(s_DescriptorPath, descriptor))
+                    s_LastHeartbeat = now;
             }
         }
 
         // Idempotent: also runs on every domain reload and on quit, whether or not the server was started.
-        public static void Stop()
+        public static void Stop() => Stop(forReload: false);
+
+        internal static void Stop(bool forReload)
         {
+            HttpListener listener;
+            Timer heartbeat;
+            CancellationTokenSource shutdown;
+            int port;
+            object localhostPrefix;
             lock (s_Lock)
             {
-                s_Heartbeat?.Dispose();
+                heartbeat = s_Heartbeat;
                 s_Heartbeat = null;
-                var listener = s_Listener;
+                listener = s_Listener;
                 s_Listener = null;
+                port = s_Port;
+                localhostPrefix = s_LocalhostPrefix;
+                s_LocalhostPrefix = null;
+                shutdown = s_Shutdown;
+                s_Shutdown = null;
+            }
+            heartbeat?.Dispose();
+            if (!forReload)
+            {
+                UnhookLifecycle();
+                PlayModeCommands.RestoreRunInBackground();
+                JobManager.Live.ForgetSaved();
+                ConsoleCommands.ForgetSaved();
+#if UPIPE_TEST_FRAMEWORK
+                TestCommands.ForgetSaved();
+#endif
+            }
+            DetachModules(forReload, serverStopped: !forReload);
+            if (!forReload)
+                JobManager.Live.CancelAll(stopAccepting: true);
+            CancelQuietly(shutdown);
+            // Queued work dies with the domain (retryable) or stops with the server (non-retryable): fail it
+            // so waiting HTTP handlers answer before the listener closes connections.
+            MainThreadQueue.FailPending(forReload);
+            lock (s_DescriptorLock)
+            {
+                s_LastHeartbeat = null;
                 DescriptorFile.DeleteIfOwned(s_DescriptorPath, s_Pid);
-                // Queued work dies with the domain: fail it so waiting requests answer 503 retryable,
-                // then give them a moment to write that reply before the listener drops connections.
-                MainThreadQueue.FailPending();
-                var deadline = DateTime.UtcNow.AddMilliseconds(ReloadDrainMilliseconds);
-                while (Volatile.Read(ref s_ExecInFlight) > 0 && DateTime.UtcNow < deadline)
-                    Thread.Sleep(10);
-                try
-                {
-                    listener?.Close();
-                }
-                catch (Exception)
-                {
-                    // already closed
-                }
+            }
+            var deadline = DateTime.UtcNow.AddMilliseconds(ReloadDrainMilliseconds);
+            while (Volatile.Read(ref s_RequestsInFlight) > 0 && DateTime.UtcNow < deadline)
+                Thread.Sleep(10);
+            try
+            {
+                RemoveMonoLoopbackPrefix(listener, port, localhostPrefix);
+                // Abort drops lingering keep-alive sockets so Mono's EndPointListener frees the port immediately on reload.
+                listener?.Abort();
+            }
+            catch (Exception)
+            {
+                // already closed
             }
         }
 
         static void Handle(HttpListenerContext context)
         {
+            Interlocked.Increment(ref s_RequestsInFlight);
             try
             {
                 var (status, body) = Route(context.Request);
@@ -253,9 +519,9 @@ namespace Upipe.Editor
             // A thread abort means the domain is unloading: let it unwind untouched.
             catch (Exception e) when (!(e is ThreadAbortException))
             {
-                // Once the server stops or the domain starts to unload, errors here are its closed listener and
-                // disposed streams, and logging from this thread while the domain unloads can crash the Editor.
-                if (IsRunning && !MainThreadQueue.DomainReloadInProgress)
+                // Once the server stops, the domain starts to unload, or the client disconnects mid-stream, errors
+                // here are closed sockets/listeners; logging from this thread during unload can also crash the Editor.
+                if (!IsClientDisconnect(e) && IsRunning && !MainThreadQueue.DomainReloadInProgress)
                     Debug.LogException(e);
                 try
                 {
@@ -263,10 +529,36 @@ namespace Upipe.Editor
                 }
                 catch (Exception)
                 {
-                    // client went away
+                    // client went away or response stream was already started/closed
                 }
             }
+            finally
+            {
+                try
+                {
+                    context.Response.Close();
+                }
+                catch (Exception)
+                {
+                    // already closed or client disconnected
+                }
+                Interlocked.Decrement(ref s_RequestsInFlight);
+            }
         }
+
+        static bool IsClientDisconnect(Exception e)
+        {
+            for (var cur = e; cur != null; cur = cur.InnerException)
+            {
+                if (cur is HttpListenerException || cur is IOException || cur is SocketException || cur is ObjectDisposedException)
+                    return true;
+            }
+            return false;
+        }
+
+        internal static bool IsAllowedHost(string host, int port) =>
+            string.Equals(host, $"127.0.0.1:{port}", StringComparison.Ordinal) ||
+            string.Equals(host, $"localhost:{port}", StringComparison.OrdinalIgnoreCase);
 
         static (int, JObject) Route(HttpListenerRequest request)
         {
@@ -274,8 +566,9 @@ namespace Upipe.Editor
             if (remote == null || !IPAddress.IsLoopback(remote.Address))
                 return (403, Failure("Forbidden", "Only loopback clients are accepted."));
             // Pinning Host defeats DNS rebinding, which a loopback check alone cannot see.
-            if (request.Headers["Host"] != $"127.0.0.1:{s_Port}")
-                return (400, Failure("Bad Request", $"Host must be 127.0.0.1:{s_Port}."));
+            // The official unity CLI switches Host from 127.0.0.1:<port> to localhost:<port> after ECONNREFUSED during reloads.
+            if (!IsAllowedHost(request.Headers["Host"], s_Port))
+                return (400, Failure("Bad Request", $"Host must be 127.0.0.1:{s_Port} or localhost:{s_Port}."));
             // Non-browser clients never send Origin; refusing it keeps web pages away from this server.
             if (!string.IsNullOrEmpty(request.Headers["Origin"]))
                 return (403, Failure("Forbidden", "Browser-originated requests are refused."));
@@ -290,7 +583,7 @@ namespace Upipe.Editor
                 case "GET /api/editor_status":
                     return (200, BuiltInCommands.EditorStatus());
                 case "GET /api/commands":
-                    return Catalog(request.QueryString);
+                    return CatalogReply(MainThreadQueue.Settled, request.QueryString);
                 case "POST /api/exec":
                     if (!TryReadBody(request, out var body))
                         return (413, Failure("Payload Too Large", $"Request body exceeds {MaxBodyBytes} bytes."));
@@ -364,6 +657,15 @@ namespace Upipe.Editor
             status["lastHeartbeat"] = s_LastHeartbeat;
             status["capabilities"] = new JArray(s_Capabilities);
             return status;
+        }
+
+        const string SettlingDetails = "The Editor is still importing or compiling after startup. Retry once /api/status reports ready.";
+
+        // The unity CLI never reads the body of /api/status: it calls an Editor `ready` when /api/commands answers 2xx
+        // and `starting` (what `status --until-ready` keeps waiting on) when it answers 503.
+        internal static (int, JObject) CatalogReply(bool settled, NameValueCollection query)
+        {
+            return settled ? Catalog(query) : (503, Busy("settling", SettlingDetails));
         }
 
         static (int, JObject) Catalog(NameValueCollection query)
@@ -571,14 +873,14 @@ namespace Upipe.Editor
                 return (400, WithCommand(reply, command, echoCommand));
             }
             if ((command.MainThreadRequired || command.WaitsForSettle) && !MainThreadQueue.Settled)
-                return (503, WithCommand(Busy("settling",
-                    "The Editor is still importing or compiling after startup. Retry once /api/status reports ready."), command, echoCommand));
+                return (503, WithCommand(Busy("settling", SettlingDetails), command, echoCommand));
             return null;
         }
 
         // Main-thread commands go through the queue; the others run on the thread pool, or on a thread of their own
-        // for a job, which may run for a long time. `started` runs right before the handler.
-        static Task<object> StartCommand(CommandEntry command, JObject values, CancellationToken token, Action started, bool ownThread)
+        // for a job, which may run for a long time. `started` runs right before the handler; `progress` is a job's reporter.
+        static Task<object> StartCommand(CommandEntry command, JObject values, CancellationToken token, Action started, bool ownThread,
+            Action<string, int?> progress = null)
         {
             if (command.MainThreadRequired)
                 return MainThreadQueue.Run(() =>
@@ -589,22 +891,35 @@ namespace Upipe.Editor
             Func<object> work = () =>
             {
                 started?.Invoke();
-                return command.CancellableHandler != null ? command.CancellableHandler(values, token) : command.Handler(values);
+                return command.CancellableHandler != null ? command.CancellableHandler(values, new CommandContext(token, progress)) : command.Handler(values);
             };
             if (!ownThread)
                 return Task.Run(work, token);
             var completion = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
-            new Thread(() =>
+            Interlocked.Increment(ref s_LiveJobThreads);
+            try
             {
-                try
+                new Thread(() =>
                 {
-                    completion.TrySetResult(work());
-                }
-                catch (Exception e)
-                {
-                    completion.TrySetException(e);
-                }
-            }) { IsBackground = true, Name = "Upipe.Job" }.Start();
+                    try
+                    {
+                        completion.TrySetResult(work());
+                    }
+                    catch (Exception e)
+                    {
+                        completion.TrySetException(e);
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref s_LiveJobThreads);
+                    }
+                }) { IsBackground = true, Name = "Upipe.Job" }.Start();
+            }
+            catch (Exception)
+            {
+                Interlocked.Decrement(ref s_LiveJobThreads);
+                throw;
+            }
             return completion.Task;
         }
 
@@ -615,16 +930,26 @@ namespace Upipe.Editor
             var refusal = Refusal(command, bound, echoCommand);
             if (refusal != null)
                 return refusal.Value;
+            var shutdown = Volatile.Read(ref s_Shutdown);
+            if (shutdown == null || shutdown.IsCancellationRequested)
+                return StopFailureReply(command, echoCommand, bound, echoParameters: false);
+            if (!command.MainThreadRequired && Volatile.Read(ref s_LiveJobThreads) >= JobManager.MaxUnfinishedJobs)
+                return (429, WithCommand(Failure("Too Many Requests",
+                    $"{JobManager.MaxUnfinishedJobs} job worker threads are still running; wait for hung jobs to exit."), command, echoCommand));
             var timeout = TimeoutMilliseconds(null, bound.Values, 0);
             JObject job;
             try
             {
                 job = JobManager.Live.Submit(command.FullName, timeout > 0 ? timeout : (int?)null,
-                    (token, started) => StartCommand(command, bound.Values, token, started, ownThread: true));
+                    (token, started, progress) => StartCommand(command, bound.Values, token, started, ownThread: true, progress));
             }
             catch (EditorReloadingException e)
             {
                 return (503, WithCommand(Busy("domain_reload", e.Message), command, echoCommand));
+            }
+            catch (ServerStoppedException e)
+            {
+                return (400, WithCommand(Failure("Server Stopped", e.Message), command, echoCommand));
             }
             if (job == null)
                 return (429, WithCommand(Failure("Too Many Requests",
@@ -671,9 +996,14 @@ namespace Upipe.Editor
             if (refusal != null)
                 return refusal.Value;
 
+            var shutdown = Volatile.Read(ref s_Shutdown);
+            if (shutdown == null || shutdown.IsCancellationRequested)
+                return StopFailureReply(command, echoCommand, bound, echoParameters);
+
             using (var timedOut = new CancellationTokenSource())
+            using (var linked = CancellationTokenSource.CreateLinkedTokenSource(shutdown.Token, timedOut.Token))
             {
-                var task = StartCommand(command, bound.Values, timedOut.Token, null, ownThread: false);
+                var task = StartCommand(command, bound.Values, linked.Token, null, ownThread: false);
                 bool finished;
                 try
                 {
@@ -684,6 +1014,15 @@ namespace Upipe.Editor
                     var inner = Unwrap(e);
                     if (inner is EditorReloadingException)
                         return (503, WithCommand(Busy("domain_reload", inner.Message), command, echoCommand));
+                    if (inner is ServerStoppedException)
+                    {
+                        reply = Failure("Server Stopped", inner.Message);
+                        if (echoParameters)
+                            reply["parameters"] = bound.Values;
+                        return (400, WithCommand(reply, command, echoCommand));
+                    }
+                    if (inner is OperationCanceledException && shutdown.IsCancellationRequested)
+                        return StopFailureReply(command, echoCommand, bound, echoParameters);
                     reply = inner is CommandFailure failure
                         ? Failure(failure.Error, failure.Message)
                         : Failure("Command Execution Failed", inner.Message);
@@ -695,8 +1034,10 @@ namespace Upipe.Editor
                 }
                 if (!finished)
                 {
+                    if (shutdown.IsCancellationRequested)
+                        return StopFailureReply(command, echoCommand, bound, echoParameters);
                     // Still queued: cancelling guarantees it never runs. Already running: it cannot be stopped.
-                    timedOut.Cancel();
+                    CancelQuietly(timedOut);
                     reply = Failure("Request Timed Out", $"No result within {timeout} ms. If the command had already started, it may still finish.");
                     reply["errorCode"] = "TIMEOUT";
                     return (504, WithCommand(reply, command, echoCommand));
@@ -709,6 +1050,29 @@ namespace Upipe.Editor
                     reply["parameters"] = bound.Values;
                 return (200, reply);
             }
+        }
+
+        internal static (int, JObject) StopFailureReply(CommandEntry command, bool echoCommand, BindResult bound, bool echoParameters)
+        {
+            if (MainThreadQueue.DomainReloadInProgress)
+            {
+                // `unity recompile` (1.0.0-beta.13) aborts on HTTP 503 while polling `recompile_status`; serve the
+                // current snapshot as 200 during reload teardown so CLI keeps polling, while other commands stay 503.
+                if (command.FullName == "script recompile_status")
+                {
+                    var compiling = new JObject { ["success"] = true };
+                    WithCommand(compiling, command, echoCommand);
+                    compiling["result"] = RecompileCommands.Current;
+                    if (echoParameters && bound != null)
+                        compiling["parameters"] = bound.Values;
+                    return (200, compiling);
+                }
+                return (503, WithCommand(Busy("domain_reload", new EditorReloadingException().Message), command, echoCommand));
+            }
+            var reply = Failure("Server Stopped", new ServerStoppedException().Message);
+            if (echoParameters && bound != null)
+                reply["parameters"] = bound.Values;
+            return (400, WithCommand(reply, command, echoCommand));
         }
 
         // Order from the docs: the request's timeout (ms), then the command's own `timeout` parameter (s), then its
@@ -724,6 +1088,23 @@ namespace Upipe.Editor
             if (long.TryParse(parameters["timeout"]?.ToString(), out var seconds) && seconds > 0)
                 return (int)(Math.Min(seconds, int.MaxValue / 1000L) * 1000); // saturate instead of overflowing
             return defaultSeconds * 1000;
+        }
+
+        // Cancel() runs the token's callbacks on this thread, and one a script registered may throw; that must not keep
+        // the caller from answering, stopping the server or cancelling the other jobs.
+        internal static void CancelQuietly(CancellationTokenSource source)
+        {
+            try
+            {
+                source?.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+            catch (AggregateException e)
+            {
+                Debug.LogWarning("[Upipe] A cancellation callback threw: " + Unwrap(e).Message);
+            }
         }
 
         // A handler that waits on other tasks can surface AggregateExceptions nested several deep.
@@ -769,6 +1150,8 @@ namespace Upipe.Editor
         {
             var bytes = Encoding.UTF8.GetBytes(body.ToString(Formatting.None));
             response.StatusCode = status;
+            // Close each connection after its reply so reload teardown never waits on or races with pooled keep-alive sockets.
+            response.KeepAlive = false;
             response.ContentType = "application/json; charset=utf-8";
             response.ContentLength64 = bytes.Length;
             response.OutputStream.Write(bytes, 0, bytes.Length);

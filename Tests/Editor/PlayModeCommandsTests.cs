@@ -11,19 +11,25 @@ namespace Upipe.Editor.Tests
         int m_PriorInterval;
         int m_PriorPersisted;
         bool m_PriorRunInBackground;
+        bool m_Remembered;
 
         [SetUp]
         public void Remember()
         {
+            m_Remembered = false;
+            Assume.That(PlayModeCommands.IsRunInBackgroundOverridden, Is.False, "an override from outside the test is active");
             m_PriorInterval = AutoTick.IntervalMs;
             m_PriorPersisted = SessionState.GetInt(AutoTick.IntervalKey, 0);
             m_PriorRunInBackground = Application.runInBackground;
-            Assume.That(PlayModeCommands.IsRunInBackgroundOverridden, Is.False, "an override from outside the test is active");
+            m_Remembered = true;
         }
 
         [TearDown]
         public void PutBack()
         {
+            // A skipped test leaves an outside override as it found it; restoring it here would leave an unrecorded value.
+            if (!m_Remembered)
+                return;
             AutoTick.Set(m_PriorInterval, m_PriorPersisted > 0);
             PlayModeCommands.RestoreRunInBackground();
             Application.runInBackground = m_PriorRunInBackground;
@@ -103,6 +109,22 @@ namespace Upipe.Editor.Tests
         {
             Assert.Throws<CommandFailure>(() => PlayModeCommands.SetRunInBackground(new JObject { ["enable"] = "yes" }));
             Assert.IsFalse(PlayModeCommands.IsRunInBackgroundOverridden);
+        }
+
+        [Test]
+        public void BuildGuardTemporarilyRestoresRunInBackgroundAroundBuilds()
+        {
+            var project = Application.runInBackground;
+            PlayModeCommands.OverrideRunInBackground(!project);
+            Assert.AreEqual(!project, Application.runInBackground);
+
+            var guard = new RunInBackgroundBuildGuard();
+            guard.OnPreprocessBuild(null);
+            Assert.AreEqual(project, Application.runInBackground, "player builds must see the saved project setting");
+            Assert.IsTrue(PlayModeCommands.IsRunInBackgroundOverridden);
+
+            guard.OnPostprocessBuild(null);
+            Assert.AreEqual(!project, Application.runInBackground, "the session override returns after the build");
         }
     }
 }
