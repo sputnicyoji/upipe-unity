@@ -173,4 +173,5 @@ Loopback only (`127.0.0.1`), `Host` pinned to `127.0.0.1:<port>` or `localhost:<
 ## Disclaimer & License
 
 - **Independent implementation**: `com.upipe.server` is independently written from public Unity Pipeline documentation and observed CLI behavior; it contains no code from `com.unity.pipeline`. Not affiliated with or endorsed by Unity Technologies.
+- **Issues & contributions**: Bug reports and feature requests are welcome via GitHub Issues. External pull requests may be ported manually into the next release commit rather than merged directly.
 - **License**: MIT, see [LICENSE.md](LICENSE.md).
