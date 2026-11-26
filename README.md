@@ -14,7 +14,7 @@ Version 0.3.2 for Unity 2022.3. Not supported: `commandLine` form, Pipeline bina
 
 ## Requirements
 
-- **Unity Editor**: 2022.3 (verified on `2022.3.62f3c1` on macOS Metal and Windows 11 D3D11)
+- **Unity Editor**: 2022.3 (verified on `2022.3.62f3c1` on macOS Metal and Windows 11 D3D11, and `2022.3.62f2c1` on Windows 11 D3D11)
 - **Official CLI**: `unity` CLI (`1.0.0-beta.13`; works with `unity command ...`, `unity recompile`, `unity status`, `unity job ...`, and `unity mcp`)
 - **Package dependency**: `com.unity.nuget.newtonsoft-json` `3.0.2` (declared in `package.json`)
 - **Optional**: `com.unity.test-framework` (`1.1.0+` for `test list/run/status` and `tests.camelCase`; `1.4.0+` for `test cancel`)
@@ -126,7 +126,7 @@ The CLI always sends a request timeout (30000 ms by default, `--timeout` seconds
 
 Known limits:
 - Enabled by default: committing the package to a shared repository turns the server on for every teammate until they switch it off locally.
-- 0.3.0 is verified on macOS (Metal) and Windows 11 (D3D11, 100% display scaling) with unity CLI 1.0.0-beta.13 and `com.unity.test-framework` 1.1.33 and 1.4.3: `-batchmode`, cold start, disabled mode, `--quit`, the interactive Editor and `unity mcp`. CLI 1.0.1 passed the 0.2.0 smoke test except `unity list`, which 1.0.1 removed. 0.3.2 is verified on macOS and Windows 11 with unity CLI 1.0.0-beta.13 and `com.unity.test-framework` 1.4.3.
+- 0.3.0 is verified on macOS (Metal) and Windows 11 (D3D11, 100% display scaling) with unity CLI 1.0.0-beta.13 and `com.unity.test-framework` 1.1.33 and 1.4.3: `-batchmode`, cold start, disabled mode, `--quit`, the interactive Editor and `unity mcp`. CLI 1.0.1 passed the 0.2.0 smoke test except `unity list`, which 1.0.1 removed. 0.3.2 is verified with unity CLI 1.0.0-beta.13 on `2022.3.62f3c1` (macOS and Windows 11, `com.unity.test-framework` 1.4.3) and `2022.3.62f2c1` (Windows 11, `com.unity.test-framework` 1.4.3 and 1.1.33).
 
 Known issue: on 2022.3.62f3c1, `-batchmode -runTests` may not exit after writing results, with or without this package installed (always on macOS, now and then on Windows). Read the results file and stop the process.
 
