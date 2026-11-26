@@ -24,7 +24,7 @@ namespace Upipe.Editor
     [InitializeOnLoad]
     internal static class UpipeServer
     {
-        internal const string FallbackVersion = "0.3.2";
+        internal const string FallbackVersion = "0.3.3";
         public static string Version { get; private set; } = FallbackVersion;
 
         const int FirstPort = 7800;

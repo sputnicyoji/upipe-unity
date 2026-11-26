@@ -2,7 +2,7 @@
 
 Independent Editor HTTP server for Unity 2022.3 that the official `unity` CLI (`unity command ...`) can drive, the same way it drives a Unity 6 project with `com.unity.pipeline`. Implemented independently under the MIT license from public Pipeline documentation and observed CLI behavior; it contains no code from `com.unity.pipeline`. Not affiliated with or endorsed by Unity Technologies.
 
-Version 0.3.2 for Unity 2022.3. Not supported: `commandLine` form, Pipeline binary transport.
+Version 0.3.3 for Unity 2022.3. Not supported: `commandLine` form, Pipeline binary transport.
 
 ## Highlights
 
@@ -21,28 +21,60 @@ Version 0.3.2 for Unity 2022.3. Not supported: `commandLine` form, Pipeline bina
 
 ## Install & Quick Start
 
-`unity pipeline install` refuses projects older than Unity 6.0, so add the package directly. Do not install it alongside `com.unity.pipeline` in the same project: both write `Library/Pipeline/.unity-pipeline-port`.
+The official `unity` CLI is a standalone binary that works independently of Unity 6. Only Unity's built-in `com.unity.pipeline` package requires Unity 6.0+, so installing `com.upipe.server` lets Unity 2022.3 projects use the exact same CLI and MCP tooling.
 
-1. **From Git** (recommended; append `#<tag>` to pin a release) in `Packages/manifest.json`:
+1. **Install the standalone `unity` CLI** (if `unity --version` is not yet installed; no Unity 6 Editor required):
 
-   ```json
-   "com.upipe.server": "https://github.com/sputnicyoji/upipe-unity.git#v0.3.2"
+   ```powershell
+   # Windows (PowerShell)
+   irm https://unity.com/install.ps1 | iex
+   ```
+   ```bash
+   # macOS / Linux
+   curl -fsSL https://unity.com/install.sh | bash
    ```
 
-2. **Embedded**: copy this folder to `<project>/Packages/com.upipe.server/`. Unity picks it up on the next focus or launch. The server is on by default for everyone who opens the project; see [Local Switch](#local-switch) below.
-3. **Local path** (developing the package itself) in `Packages/manifest.json`:
+2. **Install `com.upipe.server` in your Unity 2022.3 project** (`unity pipeline install` rejects Unity < 6.0; do not install alongside `com.unity.pipeline`, as both write `Library/Pipeline/.unity-pipeline-port`):
+   - **From Git** (recommended; append `#<tag>` to pin a release) in `Packages/manifest.json`:
 
-   ```json
-   "com.upipe.server": "file:/absolute/path/to/Packages/com.upipe.server"
+     ```json
+     "com.upipe.server": "https://github.com/sputnicyoji/upipe-unity.git#v0.3.3"
+     ```
+
+   - **Embedded**: copy this folder to `<project>/Packages/com.upipe.server/`. Unity picks it up on the next focus or launch. The server is on by default for everyone who opens the project; see [Local Switch](#local-switch) below.
+   - **Local path** (developing the package itself) in `Packages/manifest.json`:
+
+     ```json
+     "com.upipe.server": "file:/absolute/path/to/Packages/com.upipe.server"
+     ```
+
+   - **Mounted under `Assets/`** (leaving tracked project files unchanged): copy `Editor/` and `Editor.meta` to `<project>/Assets/<folder>/` and list `/Assets/<folder>/` and `/Assets/<folder>.meta` (prefixed with the project's repository subpath when nested) in `.git/info/exclude`. Package Manager does not see an `Assets/` mount, so `editor status` reports the server's built-in fallback version, which is kept equal to `package.json`.
+
+3. **Open the project and verify**: the console logs `[Upipe] HTTP server listening on 127.0.0.1:<port>`. Run:
+
+   ```bash
+   unity command --project-path <project> editor status
    ```
 
-4. **Mounted under `Assets/`** (leaving tracked project files unchanged): copy `Editor/` and `Editor.meta` to `<project>/Assets/<folder>/` and list `/Assets/<folder>/` and `/Assets/<folder>.meta` (prefixed with the project's repository subpath when nested) in `.git/info/exclude`. Package Manager does not see an `Assets/` mount, so `editor status` reports the server's built-in fallback version, which is kept equal to `package.json`.
+## Using with AI Agents (CLI & MCP)
 
-Open the project in the Unity Editor; the console logs `[Upipe] HTTP server listening on 127.0.0.1:<port>`. Then verify connectivity:
+- **Shell CLI first (recommended)**: agents running `unity command ...` use far less context than loading dozens of MCP tool schemas. Check readiness with `unity status --format json` and discover live schemas with `unity command --format json --project-path <project>`.
+- **MCP mode (`unity mcp`)**: if your AI client expects MCP tools instead of shell commands, the official CLI serves Upipe's 21 commands over stdio MCP without a third-party MCP server:
 
-```bash
-unity command --project-path <project> editor status
-```
+  ```bash
+  unity mcp configure <client> --project-path <project>   # see `unity mcp configure --list`
+  ```
+
+- **Install the bundled agent skill**: copy [`Skills~/upipe-unity/`](Skills~/upipe-unity/SKILL.md) into your client's skills folder (`.claude/skills/upipe-unity/`, `.cursor/skills/upipe-unity/`, or `.agents/skills/upipe-unity/`) so agents know not to run `unity pipeline install` on 2022.3 and follow Upipe's verification loops. Optionally install Unity's general CLI skill with `unity skill install <client>`.
+- **Switching from third-party Unity MCP servers** (no `manage_scene` / `manage_gameobject` / `manage_asset` needed):
+
+  | Workflow | Upipe + `unity` CLI |
+  |---|---|
+  | Scene, hierarchy, prefab, component, or asset edits | `unity command eval '...'` or `unity command script run -- --file <path>` |
+  | Refresh assets & check compile errors | `unity recompile --strict --project-path <project>` |
+  | Inspect or clear Editor logs | `unity command console get -- --tail 50 --level error` |
+  | Run EditMode / PlayMode tests | `unity command test run -- --test-names Ns.Fixture` |
+  | Capture Game or Scene view PNG | `unity command capture game_view -- --save-path Temp/shot.png` (or `capture scene_view`) |
 
 ## Supported Commands
 
@@ -126,7 +158,7 @@ The CLI always sends a request timeout (30000 ms by default, `--timeout` seconds
 
 Known limits:
 - Enabled by default: committing the package to a shared repository turns the server on for every teammate until they switch it off locally.
-- 0.3.0 is verified on macOS (Metal) and Windows 11 (D3D11, 100% display scaling) with unity CLI 1.0.0-beta.13 and `com.unity.test-framework` 1.1.33 and 1.4.3: `-batchmode`, cold start, disabled mode, `--quit`, the interactive Editor and `unity mcp`. CLI 1.0.1 passed the 0.2.0 smoke test except `unity list`, which 1.0.1 removed. 0.3.2 is verified with unity CLI 1.0.0-beta.13 on `2022.3.62f3c1` (macOS and Windows 11, `com.unity.test-framework` 1.4.3) and `2022.3.62f2c1` (Windows 11, `com.unity.test-framework` 1.4.3 and 1.1.33).
+- 0.3.0 is verified on macOS (Metal) and Windows 11 (D3D11, 100% display scaling) with unity CLI 1.0.0-beta.13 and `com.unity.test-framework` 1.1.33 and 1.4.3: `-batchmode`, cold start, disabled mode, `--quit`, the interactive Editor and `unity mcp`. CLI 1.0.1 passed the 0.2.0 smoke test except `unity list`, which 1.0.1 removed. 0.3.2 / 0.3.3 are verified with unity CLI 1.0.0-beta.13 on `2022.3.62f3c1` (macOS and Windows 11, `com.unity.test-framework` 1.4.3) and `2022.3.62f2c1` (Windows 11, `com.unity.test-framework` 1.4.3 and 1.1.33); see [CHANGELOG.md](CHANGELOG.md).
 
 Known issue: on 2022.3.62f3c1, `-batchmode -runTests` may not exit after writing results, with or without this package installed (always on macOS, now and then on Windows). Read the results file and stop the process.
 
@@ -137,4 +169,4 @@ Loopback only (`127.0.0.1`), `Host` pinned to `127.0.0.1:<port>` or `localhost:<
 ## Disclaimer & License
 
 - **Independent implementation**: `com.upipe.server` is independently written from public Unity Pipeline documentation and observed CLI behavior; it contains no code from `com.unity.pipeline`. Not affiliated with or endorsed by Unity Technologies.
-- **License**: MIT, see `LICENSE.md`.
+- **License**: MIT, see [LICENSE.md](LICENSE.md).
