@@ -4,13 +4,17 @@ Independent Editor HTTP server for Unity 2022.3 that the official `unity` CLI (`
 
 Version 0.3.4 for Unity 2022.3. Not supported: `commandLine` form, Pipeline binary transport.
 
-## Highlights
+## Why Upipe + `unity` CLI (vs. Third-Party Unity MCPs)
 
-- **Pure Editor assembly (`Upipe.Editor`)**: zero runtime code shipped in Player builds, lazy-attach when disabled (`UPIPE_ENABLE=0` or local switch) with zero runtime hooks or polling overhead.
-- **Unfocused automation on Windows & macOS**: background-friendly command queue, `editor.playmode`, `test run` via `TestRunnerApi` (`EditorApplication.update`-driven), and `editor quit`.
-- **Two-tier SHA-256 `script eval` cache**: 64-entry in-memory LRU + bounded 128-entry local disk cache under `Temp/UpipeEval/cache/` skips out-of-process `csc.dll` recompilation on cache hits while loading a fresh isolated assembly per invocation.
-- **Complete test & capture workflow**: EditMode/PlayMode/`all` test execution, exact `--test-names`, `test cancel` on `com.unity.test-framework` 1.4.0+, off-screen & screen `capture game_view` / `capture scene_view` (including Device Simulator).
-- **Hardened localhost server**: loopback-only listener (`127.0.0.1:<port>` + Windows IPv4 `localhost:<port>`), `Origin` rejection, 256-bit `SessionState` bearer token, owner-only descriptor permissions (`0600` / protected Windows DACL), and Windows 8.3 path canonicalization.
+Use Upipe + Unity's official `unity` CLI to **replace or supplement** third-party Unity MCP servers when you need lower prompt overhead, full Editor API access, and reliable background automation:
+
+| Area | Typical Third-Party Unity MCP | Upipe + Official `unity` CLI |
+|---|---|---|
+| **Context & API reach** | Loads dozens of JSON tool schemas every turn; constrained to fixed wrapper endpoints | Shell-first `unity command ...` avoids schema bloat, while C# `script eval` / `script run` reach any Unity Editor API or project type (two-tier SHA-256 cache—64-entry memory LRU + 128-entry `Temp/UpipeEval/cache/` disk cache—skips `csc.dll` on repeat runs with fresh isolated assembly loads; `unity mcp` still serves all 21 tools for MCP-only clients) |
+| **Background / unfocused runs** | Often depends on `delayCall` or Editor window focus, stalling when unfocused or minimized | Background-friendly queue, `EditorApplication.update`-driven `TestRunnerApi`, `editor.playmode` (with automatic `runInBackground` restore and Player build guard), off-screen/screen `capture game_view` / `scene_view` (including Device Simulator), and `editor quit` run reliably unfocused on Windows & macOS |
+| **Test & asset safety** | Missing test names can pass silently; dirty scenes trigger blocking save dialogs; no test cancel | Exact `--test-names` fail with `TEST_NAMES_NOT_RUN` instead of false-green passes; interactive `UNSAVED_SCENES` refusal avoids modal save-dialog hangs; `test cancel` (`test-framework` 1.4.0+) stops active runs and restores starting scenes; captures write to `Temp/` or inline `base64` without polluting `Assets/` |
+| **Runtime & Unity 6 path** | Requires an extra Python (`uv`) or Node bridge process kept in sync with an Editor plugin | Talks directly to Unity's standalone `unity` CLI binary with no extra bridge runtime, and carries the same CLI commands and bundled agent skill forward to Unity 6 (`com.unity.pipeline`) |
+| **Shared-repo adoption & security** | Often adds `manifest.json` churn or unauthenticated local ports shared across a team | Pure `Upipe.Editor` assembly (zero Player build code) with lazy-attach zero overhead when disabled (`UPIPE_ENABLE=0` or local switch), loopback-only HTTP + `Origin` rejection + 256-bit `SessionState` bearer token + owner-only descriptor (`0600` / protected Windows DACL) + Windows 8.3 canonicalization, and optional `Assets/` + `.git/info/exclude` mounting with zero tracked-file changes |
 
 ## Requirements
 
