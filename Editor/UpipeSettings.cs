@@ -22,7 +22,7 @@ namespace Upipe.Editor
 
         static string EnvironmentValue => Environment.GetEnvironmentVariable(EnvironmentVariable);
 
-        public static bool IsEnabled() => Decide(ReadFile(), EnvironmentValue);
+        public static bool IsEnabled() => !UpipeServer.IsSecondaryProcess && Decide(ReadFile(), EnvironmentValue);
 
         // Pure, so tests need neither the process environment nor a UserSettings folder.
         internal static bool Decide(string fileText, string environmentValue)
@@ -78,6 +78,8 @@ namespace Upipe.Editor
         [MenuItem(MenuPath)]
         static void Toggle()
         {
+            if (UpipeServer.IsSecondaryProcess)
+                return;
             if (ParseSwitch(EnvironmentValue).HasValue)
             {
                 Debug.LogWarning($"[Upipe] {EnvironmentVariable} decides whether the server runs; unset it to use this menu.");
@@ -93,6 +95,11 @@ namespace Upipe.Editor
         [MenuItem(MenuPath, true)]
         static bool CanToggle()
         {
+            if (UpipeServer.IsSecondaryProcess)
+            {
+                Menu.SetChecked(MenuPath, false);
+                return false;
+            }
             Menu.SetChecked(MenuPath, IsEnabled());
             return !ParseSwitch(EnvironmentValue).HasValue;
         }

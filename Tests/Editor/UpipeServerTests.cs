@@ -14,6 +14,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
+using UnityEditor.MPE;
 using UnityEngine;
 
 namespace Upipe.Editor.Tests
@@ -282,7 +283,7 @@ namespace Upipe.Editor.Tests
                 Assert.IsTrue(DescriptorFile.Write(path, new JObject { ["pid"] = 2 }));
                 AssertOwnerOnly(path);
                 Assert.AreEqual(2, (int)JObject.Parse(File.ReadAllText(path))["pid"]);
-                Assert.IsFalse(File.Exists(path + ".tmp"));
+                Assert.IsEmpty(Directory.GetFiles(Path.GetDirectoryName(path), "*.tmp"));
             }
             finally
             {
@@ -472,6 +473,84 @@ namespace Upipe.Editor.Tests
             Assert.AreEqual(UpipeServer.CanonicalizePath(UpipeServer.ProjectPath), UpipeServer.ProjectPath);
             Assert.AreEqual("Assets/Shot.png", CaptureCommands.AssetRelativePath(
                 UpipeServer.ProjectPath, UpipeServer.ResolveProjectPath("Assets/Shot.png"), UpipeServer.PathsIgnoreCase));
+        }
+
+        [Test]
+        public void SecondaryProcessGuardSkipsImportWorkersAndSecondaryMpeProcesses()
+        {
+            Assert.IsFalse(UpipeServer.ShouldSkipProcess(false, ProcessLevel.Main));
+            Assert.IsFalse(UpipeServer.ShouldSkipProcess(false, ProcessLevel.Undefined));
+            Assert.IsTrue(UpipeServer.ShouldSkipProcess(true, ProcessLevel.Main));
+            Assert.IsTrue(UpipeServer.ShouldSkipProcess(true, ProcessLevel.Undefined));
+            Assert.IsTrue(UpipeServer.ShouldSkipProcess(false, ProcessLevel.Secondary));
+            Assert.IsTrue(UpipeServer.ShouldSkipProcess(true, ProcessLevel.Secondary));
+            Assert.IsFalse(UpipeServer.IsSecondaryProcess, "main/batchmode Editor must not be treated as a secondary process");
+        }
+
+        [Test]
+        public void DescriptorWriteUsesUniqueTempPathAndDoesNotCollideWithLockedLegacyTemp()
+        {
+            var directory = Path.Combine(Path.GetTempPath(), "upipe-descriptor-temp-" + Guid.NewGuid().ToString("N"));
+            var path = Path.Combine(directory, ".unity-pipeline-port");
+            var firstTemp = DescriptorFile.TempPathFor(path, 1234);
+            var secondTemp = DescriptorFile.TempPathFor(path, 1234);
+            Assert.AreNotEqual(firstTemp, secondTemp);
+            StringAssert.StartsWith(path + ".1234.", firstTemp);
+            StringAssert.EndsWith(".tmp", firstTemp);
+
+            Directory.CreateDirectory(directory);
+            try
+            {
+                using (new FileStream(path + ".tmp", FileMode.Create, FileAccess.ReadWrite, FileShare.None))
+                {
+                    Assert.IsTrue(DescriptorFile.Write(path, new JObject { ["pid"] = 42 }));
+                }
+                Assert.AreEqual(42, (int)JObject.Parse(File.ReadAllText(path))["pid"]);
+                CollectionAssert.AreEqual(new[] { path + ".tmp" }, Directory.GetFiles(directory, "*.tmp"));
+            }
+            finally
+            {
+                Directory.Delete(directory, true);
+            }
+        }
+
+        [Test]
+        public void DeleteIfOwnedOnlyCleansOwnOrStaleTempFiles()
+        {
+            var directory = Path.Combine(Path.GetTempPath(), "upipe-descriptor-clean-" + Guid.NewGuid().ToString("N"));
+            var path = Path.Combine(directory, ".unity-pipeline-port");
+            var currentPid = Process.GetCurrentProcess().Id;
+            var liveTemp = $"{path}.{currentPid}.aaa.tmp";
+            var callerTemp = $"{path}.999999.bbb.tmp";
+            var legacyTemp = path + ".tmp";
+            var staleTemp = $"{path}.2147483647.ccc.tmp";
+            Directory.CreateDirectory(directory);
+            try
+            {
+                File.WriteAllText(path, "{\"pid\": " + currentPid + "}");
+                File.WriteAllText(liveTemp, "{}");
+                File.WriteAllText(callerTemp, "{}");
+                File.WriteAllText(legacyTemp, "{}");
+
+                DescriptorFile.DeleteIfOwned(path, 999999, orStale: true);
+                Assert.IsTrue(File.Exists(path));
+                Assert.IsTrue(File.Exists(liveTemp));
+                Assert.IsTrue(File.Exists(legacyTemp));
+                Assert.IsFalse(File.Exists(callerTemp));
+
+                File.WriteAllText(path, "{\"pid\": 2147483647}");
+                File.WriteAllText(staleTemp, "{}");
+
+                DescriptorFile.DeleteIfOwned(path, 999999, orStale: true);
+                Assert.IsFalse(File.Exists(path));
+                Assert.IsFalse(File.Exists(staleTemp));
+                Assert.IsFalse(File.Exists(legacyTemp));
+                Assert.IsTrue(File.Exists(liveTemp));
+            }
+            finally
+            {
+                Directory.Delete(directory, true);
+            }
         }
 
         static string SendRawGet(int port, string hostHeader, string token)

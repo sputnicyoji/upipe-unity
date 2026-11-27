@@ -21,6 +21,7 @@ namespace Upipe.Editor
         const int OwnerReadWrite = 0x180; // 0600
         const int ReplaceRetryCount = 4;
         const int ReplaceRetryDelayMs = 25;
+        static readonly int s_Pid = Process.GetCurrentProcess().Id;
 
         [DllImport("libc", SetLastError = true)]
         static extern int chmod(string path, int mode);
@@ -30,10 +31,12 @@ namespace Upipe.Editor
             return Path.Combine(projectPath, "Library", "Pipeline", ".unity-pipeline-port");
         }
 
+        internal static string TempPathFor(string path, int pid) => $"{path}.{pid}.{Guid.NewGuid():N}.tmp";
+
         // Writes an owner-only temp file and renames it over the target, so readers never see a partial file.
         public static bool Write(string path, JObject descriptor)
         {
-            var temp = path + ".tmp";
+            var temp = TempPathFor(path, s_Pid);
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(path));
@@ -90,18 +93,43 @@ namespace Upipe.Editor
             }
         }
 
+        static void CleanupTempFilesForPid(string path, int pid)
+        {
+            try
+            {
+                var directory = Path.GetDirectoryName(path);
+                if (string.IsNullOrEmpty(directory) || !Directory.Exists(directory))
+                    return;
+                var pattern = $"{Path.GetFileName(path)}.{pid}.*.tmp";
+                foreach (var file in Directory.GetFiles(directory, pattern))
+                    TryDelete(file);
+            }
+            catch (Exception)
+            {
+                // best-effort cleanup
+            }
+        }
+
         // Only remove a descriptor this process wrote, or with orStale one whose writer has exited (a crash or a
         // SIGTERM in batchmode leaves it behind); another live instance may own the file.
         public static void DeleteIfOwned(string path, int pid, bool orStale = false)
         {
-            TryDelete(path + ".tmp");
+            if (string.IsNullOrEmpty(path))
+                return;
+            CleanupTempFilesForPid(path, pid);
             try
             {
                 if (!File.Exists(path))
                     return;
                 var owner = (int?)JObject.Parse(File.ReadAllText(path))["pid"];
                 if (owner == pid || (orStale && owner.HasValue && !IsRunning(owner.Value)))
+                {
                     File.Delete(path);
+                    if (owner.HasValue && owner.Value != pid)
+                        CleanupTempFilesForPid(path, owner.Value);
+                    // Clean up any legacy fixed-name temp file left by pre-0.3.5 versions once ownership/staleness is confirmed.
+                    TryDelete(path + ".tmp");
+                }
             }
             catch (Exception e)
             {

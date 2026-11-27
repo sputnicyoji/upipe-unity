@@ -18,6 +18,7 @@ using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
+using UnityEditor.MPE;
 using UnityEngine;
 
 namespace Upipe.Editor
@@ -27,7 +28,7 @@ namespace Upipe.Editor
     [InitializeOnLoad]
     internal static class UpipeServer
     {
-        internal const string FallbackVersion = "0.3.4";
+        internal const string FallbackVersion = "0.3.5";
         public static string Version { get; private set; } = FallbackVersion;
 
         const int FirstPort = 7800;
@@ -113,9 +114,21 @@ namespace Upipe.Editor
         static int s_LiveJobThreads;
         static CancellationTokenSource s_Shutdown;
         static bool s_LifecycleHooked;
+        static readonly bool s_IsSecondaryProcess;
+        internal static bool IsSecondaryProcess => s_IsSecondaryProcess;
+
+        // Asset import workers and MPE secondary processes load Editor assemblies and run [InitializeOnLoad];
+        // they must never bind ports, attach runtime hooks, or touch the project's descriptor file.
+        // Checking ProcessLevel.Secondary (instead of != Main) avoids skipping batchmode if level is Undefined.
+        internal static bool ShouldSkipProcess(bool isAssetImportWorker, ProcessLevel processLevel) =>
+            isAssetImportWorker || processLevel == ProcessLevel.Secondary;
 
         static UpipeServer()
         {
+            s_IsSecondaryProcess = ShouldSkipProcess(AssetDatabase.IsAssetImportWorkerProcess(), ProcessService.level);
+            if (s_IsSecondaryProcess)
+                return;
+
             var packageVersion = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(UpipeServer).Assembly)?.version;
             if (!string.IsNullOrEmpty(packageVersion))
                 Version = packageVersion;
@@ -216,6 +229,8 @@ namespace Upipe.Editor
         // Starts or stops the server to match the setting, without restarting the Editor.
         public static void ApplySettings()
         {
+            if (s_IsSecondaryProcess)
+                return;
             var enabled = UpipeSettings.IsEnabled();
             if (enabled && !IsRunning)
                 Start();
@@ -228,6 +243,8 @@ namespace Upipe.Editor
 
         public static void Start()
         {
+            if (s_IsSecondaryProcess)
+                return;
             int port;
             lock (s_Lock)
             {
@@ -456,6 +473,8 @@ namespace Upipe.Editor
 
         internal static void Stop(bool forReload)
         {
+            if (s_IsSecondaryProcess)
+                return;
             HttpListener listener;
             Timer heartbeat;
             CancellationTokenSource shutdown;

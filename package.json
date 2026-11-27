@@ -1,7 +1,7 @@
 {
   "name": "com.upipe.server",
   "displayName": "Upipe Server",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "unity": "2022.3",
   "description": "Editor HTTP server compatible with the official unity CLI (unity command ...) for Unity 2022.3 projects. Contains no com.unity.pipeline code; not affiliated with Unity Technologies.",
   "license": "MIT",

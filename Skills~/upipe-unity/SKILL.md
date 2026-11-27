@@ -5,7 +5,7 @@ description: Drive running Unity 2022.3 Editors via com.upipe.server with the st
 
 # Upipe Unity (2022.3)
 
-`com.upipe.server` brings the official `unity` CLI protocol to Unity 2022.3 as a pure Editor package (`127.0.0.1`, bearer token, no `com.unity.pipeline` code). Install it via `Packages/manifest.json` (`"com.upipe.server": "https://github.com/sputnicyoji/upipe-unity.git#v0.3.4"`) or embed in `Packages/com.upipe.server/` instead of running `unity pipeline install` (which rejects Unity < 6.0), and keep `com.unity.pipeline` absent from the same project so only one server owns `Library/Pipeline/.unity-pipeline-port`.
+`com.upipe.server` brings the official `unity` CLI protocol to Unity 2022.3 as a pure Editor package (`127.0.0.1`, bearer token, no `com.unity.pipeline` code). Install it via `Packages/manifest.json` (`"com.upipe.server": "https://github.com/sputnicyoji/upipe-unity.git#v0.3.5"`) or embed in `Packages/com.upipe.server/` instead of running `unity pipeline install` (which rejects Unity < 6.0), and keep `com.unity.pipeline` absent from the same project so only one server owns `Library/Pipeline/.unity-pipeline-port`.
 
 ## Connect & target
 

@@ -5,6 +5,12 @@ All notable changes to this package are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-11-27
+
+### Fixed
+- Skip Upipe initialization, server startup, runtime hook attachment, descriptor writes/deletions, and menu toggling in Unity asset import worker processes (`AssetDatabase.IsAssetImportWorkerProcess()`) and MPE secondary Editor processes (`ProcessService.level == ProcessLevel.Secondary`), preventing port contention and descriptor hijacking when parallel asset import is enabled.
+- Write instance descriptors through unique per-process, per-write temporary files (`<path>.<pid>.<guid>.tmp`) and scope `DescriptorFile.DeleteIfOwned` temporary-file cleanup to the caller's or confirmed stale owner's PID so concurrent writers cannot collide on a shared `.tmp` path.
+
 ## [0.3.4] - 2026-11-26
 
 ### Changed
